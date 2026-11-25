@@ -1,6 +1,6 @@
 --!nocheck
 --[[
-	BeverlyHub v1.5.1 — RoChess!
+	BeverlyHub v2.0.0 — RoChess!
 	Hybrid Chess Engine (Stockfish 19 VPS + Cloud + Independent Offline Luau Engine)
 	Board Arrow Overlay, Live Analysis, Dynamic Auto-Adapt Strength & Safe Auto Play
 ]]
@@ -31,7 +31,7 @@ end
 
 local LIB_BASE = "https://raw.githubusercontent.com/bevankeren/BeverlyLIB/main/"
 local REMOTE_SCRIPT_URL = "https://raw.githubusercontent.com/bevankeren/rochess/main/rochess.lua"
-local HUB_VERSION = "1.5.1"
+local HUB_VERSION = "2.0.0"
 
 -- ============================================================================
 -- 1. CONFIGURATION & RUNTIME STATE
@@ -201,6 +201,7 @@ do
 	local SQ64 = table.create(120, 0)
 	local PST_IDX_W = table.create(120, 1)
 	local PST_IDX_B = table.create(120, 1)
+	local CENTER_DIST = table.create(120, 0)
 	for rank = 0, 7 do
 		for file = 0, 7 do
 			local idx64 = rank * 8 + file + 1
@@ -209,8 +210,17 @@ do
 			SQ64[sq] = idx64
 			PST_IDX_W[sq] = (7 - rank) * 8 + file + 1
 			PST_IDX_B[sq] = rank * 8 + file + 1
+			local df = math.max(3 - file, file - 4)
+			local dr = math.max(3 - rank, rank - 4)
+			CENTER_DIST[sq] = df + dr
 		end
 	end
+	local PASSED_MG = { 5, 10, 20, 35, 60, 100 }
+	local PASSED_EG = { 10, 20, 40, 75, 130, 210 }
+	local evalWMinR = table.create(8, 8)
+	local evalBMaxR = table.create(8, -1)
+	local evalWPawns = table.create(8, 0)
+	local evalBPawns = table.create(8, 0)
 
 	local CASTLE_MASK = table.create(120, 15)
 	CASTLE_MASK[22] = 13 -- a1
@@ -591,9 +601,9 @@ do
 					local promoRank = (side == 1) and 6 or 1
 					local startRank = (side == 1) and 1 or 6
 
-					-- Captures & EP
-					for _, off in { dir - 1, dir + 1 } do
-						local toSq = sq + off
+					-- Captures & EP (unrolled: zero per-pawn table allocation)
+					for ci = -1, 1, 2 do
+						local toSq = sq + dir + ci
 						local cap = b[toSq]
 						if cap ~= OFF and cap ~= 0 and (cap > 0) ~= (side > 0) then
 							if rank == promoRank then
@@ -945,6 +955,32 @@ do
 		return nil
 	end
 
+	function Board:applyUciFast(uci)
+		if type(uci) ~= "string" or #uci < 4 then return false end
+		local fromSq = PureChess.algToSq(string.sub(uci, 1, 2))
+		local toSq = PureChess.algToSq(string.sub(uci, 3, 4))
+		if not fromSq or not toSq then return false end
+		local pc = self.board[fromSq]
+		if pc == EMPTY or pc == OFF or (pc > 0) ~= (self.side > 0) then
+			return false
+		end
+		local pt = abs(pc)
+		local promoCh = string.lower(string.sub(uci, 5, 5))
+		local promo = (promoCh ~= "") and (CHAR_TO_PIECE[promoCh] or 0) or 0
+		local flag = F_NONE
+		if pt == KING and abs(toSq - fromSq) == 2 then
+			flag = (toSq > fromSq) and F_OO or F_OOO
+		elseif pt == PAWN then
+			if abs(toSq - fromSq) == 20 then
+				flag = F_DOUBLE
+			elseif toSq == self.ep and self.ep ~= 0 then
+				flag = F_EP
+			end
+		end
+		self:makeMove(encodeMove(fromSq, toSq, promo, flag))
+		return true
+	end
+
 	function Board:moveToSan(m)
 		local b = self.board
 		local fromSq = band(m, 127)
@@ -1000,6 +1036,11 @@ do
 		local b = self.board
 		local mgW, mgB, egW, egB, phase = 0, 0, 0, 0, 0
 		local bishW, bishB = 0, 0
+		local wPCount, bPCount = 0, 0
+		for f = 1, 8 do
+			evalWMinR[f] = 8
+			evalBMaxR[f] = -1
+		end
 		for i = 1, 64 do
 			local sq = SQUARES[i]
 			local pc = b[sq]
@@ -1008,18 +1049,77 @@ do
 				mgW += MG_VAL[pc] + MG_PST[pc][idx]
 				egW += EG_VAL[pc] + EG_PST[pc][idx]
 				phase += PHASE_W[pc]
-				if pc == BISHOP then bishW += 1 end
+				if pc == BISHOP then
+					bishW += 1
+				elseif pc == PAWN then
+					wPCount += 1
+					evalWPawns[wPCount] = sq
+					local fi = (sq - 2) % 10 + 1
+					local r = (sq - 22) // 10
+					if r < evalWMinR[fi] then evalWMinR[fi] = r end
+				end
 			elseif pc < 0 then
 				local pt = -pc
 				local idx = PST_IDX_B[sq]
 				mgB += MG_VAL[pt] + MG_PST[pt][idx]
 				egB += EG_VAL[pt] + EG_PST[pt][idx]
 				phase += PHASE_W[pt]
-				if pt == BISHOP then bishB += 1 end
+				if pt == BISHOP then
+					bishB += 1
+				elseif pt == PAWN then
+					bPCount += 1
+					evalBPawns[bPCount] = sq
+					local fi = (sq - 2) % 10 + 1
+					local r = (sq - 22) // 10
+					if r > evalBMaxR[fi] then evalBMaxR[fi] = r end
+				end
 			end
 		end
 		if bishW >= 2 then mgW += 30; egW += 45 end
 		if bishB >= 2 then mgB += 30; egB += 45 end
+
+		-- Passed-pawn bonus (zero-alloc via per-file min/max opposing rank arrays)
+		for i = 1, wPCount do
+			local sq = evalWPawns[i]
+			local fi = (sq - 2) % 10 + 1
+			local r = (sq - 22) // 10
+			if (fi == 1 or evalBMaxR[fi - 1] <= r) and evalBMaxR[fi] <= r and (fi == 8 or evalBMaxR[fi + 1] <= r) then
+				mgW += PASSED_MG[r] or 0
+				egW += PASSED_EG[r] or 0
+			end
+		end
+		for i = 1, bPCount do
+			local sq = evalBPawns[i]
+			local fi = (sq - 2) % 10 + 1
+			local r = (sq - 22) // 10
+			if (fi == 1 or evalWMinR[fi - 1] >= r) and evalWMinR[fi] >= r and (fi == 8 or evalWMinR[fi + 1] >= r) then
+				local relR = 7 - r
+				mgB += PASSED_MG[relR] or 0
+				egB += PASSED_EG[relR] or 0
+			end
+		end
+
+		-- Endgame mop-up: drive enemy king to corner & close king distance when winning
+		if phase <= 6 then
+			local rawEg = egW - egB
+			if rawEg > 220 or rawEg < -220 then
+				local winCol = (rawEg > 0) and 1 or -1
+				local winK = self.kingSq[winCol]
+				local loseK = self.kingSq[-winCol]
+				if winK ~= 0 and loseK ~= 0 then
+					local wf, wr = (winK - 2) % 10, (winK - 22) // 10
+					local lf, lr = (loseK - 2) % 10, (loseK - 22) // 10
+					local md = abs(wf - lf) + abs(wr - lr)
+					local mopUp = CENTER_DIST[loseK] * 14 + (14 - md) * 6
+					if winCol == 1 then
+						egW += mopUp
+					else
+						egB += mopUp
+					end
+				end
+			end
+		end
+
 		local mg = mgW - mgB
 		local eg = egW - egB
 		if phase > 24 then phase = 24 end
@@ -1063,7 +1163,7 @@ do
 		return (p[1] or "") .. " " .. (p[2] or "w") .. " " .. (p[3] or "-") .. " " .. (p[4] or "-")
 	end
 
-	function PureChess.search(fen, maxDepth, timeBudget, cancelFn)
+	function PureChess.search(fen, maxDepth, timeBudget, cancelFn, recentUcis)
 		local t0 = os.clock()
 		local board = PureChess.new(fen)
 
@@ -1088,6 +1188,36 @@ do
 			end
 		end
 
+		-- Precompute reversible game-history hashes so won endgames avoid 3-fold draws
+		local histH1, histH2 = {}, {}
+		local histCount = 0
+		if type(recentUcis) == "table" then
+			if type(recentUcis.h1) == "table" and type(recentUcis.h2) == "table" then
+				for i = 1, #recentUcis.h1 do
+					histCount += 1
+					histH1[histCount] = recentUcis.h1[i]
+					histH2[histCount] = recentUcis.h2[i]
+				end
+			elseif #recentUcis > 0 and board.halfmove > 0 then
+				local hb = PureChess.new()
+				local okReplay = true
+				for i = 1, #recentUcis do
+					if not hb:applyUciFast(recentUcis[i]) then
+						okReplay = false
+						break
+					end
+				end
+				if okReplay and hb.h1 == board.h1 and hb.h2 == board.h2 then
+					local startP = math.max(0, hb.ply - hb.halfmove)
+					for p = startP, hb.ply - 1 do
+						histCount += 1
+						histH1[histCount] = hb.posH1[p]
+						histH2[histCount] = hb.posH2[p]
+					end
+				end
+			end
+		end
+
 		local deadline = t0 + (timeBudget or 0.55)
 		local maxD = math.clamp(maxDepth or 6, 1, 10)
 		local nodes = 0
@@ -1096,6 +1226,8 @@ do
 		local killers1 = table.create(64, 0)
 		local killers2 = table.create(64, 0)
 		local history = {}
+		local iterBestMove = 0
+		local iterBestScore = -INF
 
 		local function checkStop()
 			if cancelFn and cancelFn() then
@@ -1159,24 +1291,27 @@ do
 
 		local function qsearch(alpha, beta, ply)
 			nodes += 1
-			if band(nodes, 4095) == 0 and checkStop() then
+			if band(nodes, 511) == 0 and checkStop() then
 				return 0
 			end
 			if ply >= 60 then
 				return board:evaluate()
 			end
-			local standPat = board:evaluate()
-			if standPat >= beta then
-				return beta
-			end
-			if standPat > alpha then
-				alpha = standPat
+			local inChk = board:inCheck()
+			if not inChk then
+				local standPat = board:evaluate()
+				if standPat >= beta then
+					return beta
+				end
+				if standPat > alpha then
+					alpha = standPat
+				end
 			end
 
 			local moves = {}
-			local cnt = board:genPseudo(moves, true)
+			local cnt = board:genPseudo(moves, not inChk)
 			if cnt == 0 then
-				return alpha
+				return inChk and (-MATE + ply) or alpha
 			end
 			local scores = table.create(cnt, 0)
 			for i = 1, cnt do
@@ -1184,10 +1319,12 @@ do
 			end
 
 			local side = board.side
+			local legalCount = 0
 			for i = 1, cnt do
 				local m = pickBest(moves, scores, i, cnt)
 				board:makeMove(m)
 				if not board:isAttacked(board.kingSq[side], -side) then
+					legalCount += 1
 					local sc = -qsearch(-beta, -alpha, ply + 1)
 					board:undoMove()
 					if aborted then return 0 end
@@ -1196,6 +1333,9 @@ do
 				else
 					board:undoMove()
 				end
+			end
+			if inChk and legalCount == 0 then
+				return -MATE + ply
 			end
 			return alpha
 		end
@@ -1209,12 +1349,19 @@ do
 					return true
 				end
 			end
+			if histCount > 0 then
+				for i = 1, histCount do
+					if histH1[i] == ch1 and histH2[i] == ch2 then
+						return true
+					end
+				end
+			end
 			return false
 		end
 
 		local function negamax(depth, alpha, beta, ply, allowNull)
 			nodes += 1
-			if band(nodes, 4095) == 0 and checkStop() then
+			if band(nodes, 511) == 0 and checkStop() then
 				return 0
 			end
 			if ply >= 60 then
@@ -1300,6 +1447,10 @@ do
 					if sc > bestScore then
 						bestScore = sc
 						bestMove = m
+						if ply == 0 then
+							iterBestMove = m
+							iterBestScore = sc
+						end
 					end
 					if sc > alpha then
 						alpha = sc
@@ -1378,13 +1529,23 @@ do
 		local targetDepth = (#legalRoot == 1) and math.min(2, maxD) or maxD
 
 		for d = 1, targetDepth do
+			iterBestMove = 0
+			iterBestScore = -INF
 			local sc = negamax(d, -INF, INF, 0, true)
 			if aborted then
+				if iterBestMove ~= 0 then
+					bestMove = iterBestMove
+					bestScore = iterBestScore
+				end
 				break
 			end
-			local slot = band(board.h1, TT_MASK) + 1
-			if ttH1[slot] == board.h1 and ttH2[slot] == board.h2 and ttMove[slot] ~= 0 then
-				bestMove = ttMove[slot]
+			if iterBestMove ~= 0 then
+				bestMove = iterBestMove
+			else
+				local slot = band(board.h1, TT_MASK) + 1
+				if ttH1[slot] == board.h1 and ttH2[slot] == board.h2 and ttMove[slot] ~= 0 then
+					bestMove = ttMove[slot]
+				end
 			end
 			bestScore = sc
 			reachedDepth = d
@@ -1465,6 +1626,73 @@ local function countFenPieces(fen)
 	return total
 end
 
+local function getLiveClockMs(session, color)
+	if not session or not session.clocks or not color then
+		return nil
+	end
+	if type(session.clockFor) == "function" then
+		local ok, ms = pcall(session.clockFor, session, color, workspace:GetServerTimeNow())
+		if ok and type(ms) == "number" then
+			return ms
+		end
+	end
+	return session.clocks[color]
+end
+
+local function resolveSessionTimeControl(sess)
+	if not sess then
+		return nil, 0
+	end
+	local tc = sess.tc
+	local tcStr = nil
+	if type(tc) == "string" then
+		tcStr = tc
+	elseif type(tc) == "table" then
+		local rawBase = tonumber(tc.baseMs or tc.initialMs)
+		local rawInc = tonumber(tc.incMs) or 0
+		if rawBase and rawBase >= 10000 then
+			return rawBase, rawInc
+		end
+		local baseSec = tonumber(tc.base or tc.initial or tc.seconds)
+		if baseSec and baseSec > 0 then
+			local bMs = (baseSec >= 10000) and baseSec or (baseSec * 1000)
+			local iSec = tonumber(tc.inc or tc.increment) or 0
+			local iMs = (iSec >= 1000) and iSec or (iSec * 1000)
+			return bMs, iMs
+		end
+		tcStr = (type(tc.id) == "string" and tc.id) or (type(tc.name) == "string" and tc.name) or nil
+	end
+	if type(tcStr) == "string" then
+		local mStr, iStr = string.match(tcStr, "(%d+%.?%d*)%+(%d+%.?%d*)")
+		if mStr then
+			local mins = tonumber(mStr)
+			local incS = tonumber(iStr) or 0
+			if mins and mins > 0 then
+				return math.floor(mins * 60000 + 0.5), math.floor(incS * 1000 + 0.5)
+			end
+		end
+	end
+	local ply = (type(sess.ucis) == "table") and #sess.ucis or 0
+	if ply <= 1 and sess.clocks then
+		local cMax = math.max(tonumber(sess.clocks[1]) or 0, tonumber(sess.clocks[-1]) or 0)
+		if cMax >= 10000 then
+			return cMax, 0
+		end
+	end
+	return nil, 0
+end
+
+local function cancelPrefetchState()
+	STATE.PrefetchGen += 1
+	STATE.PrefetchKey = ""
+	STATE.PrefetchFen4 = ""
+	STATE.PrefetchDone = nil
+end
+
+local function isStockfishSource(src)
+	return src == "VpsSF" or src == "Stockfish" or src == "LocalSF"
+end
+
 local function enrichMoveInfo(fen, res)
 	if not res or type(res.best) ~= "string" or #res.best < 4 then
 		return nil
@@ -1522,7 +1750,7 @@ local function hasVpsConfigured()
 	return type(CONFIG.VpsApiUrl) == "string" and string.match(CONFIG.VpsApiUrl, "^https?://.+") ~= nil
 end
 
-local function queryVpsStockfish(fen, depth, movetimeMs, multipv, timeoutSec, cancelFn)
+local function queryVpsStockfish(fen, depth, movetimeMs, multipv, timeoutSec, cancelFn, reqOpts)
 	if type(httpRequest) ~= "function" then
 		return nil, "no_http"
 	end
@@ -1532,6 +1760,9 @@ local function queryVpsStockfish(fen, depth, movetimeMs, multipv, timeoutSec, ca
 	if os.clock() < STATE.VpsCooldownUntil then
 		return nil, "vps_cooldown"
 	end
+	local isSpeculative = (type(reqOpts) == "table" and reqOpts.speculative == true)
+	local noPenalty = isSpeculative or (type(reqOpts) == "table" and reqOpts.noPenalty == true)
+
 	local base = string.gsub(CONFIG.VpsApiUrl, "/+$", "")
 	local d = math.clamp(depth or 15, 1, 22)
 	local mt = math.clamp(math.floor(movetimeMs or 280), 0, 3000)
@@ -1540,6 +1771,9 @@ local function queryVpsStockfish(fen, depth, movetimeMs, multipv, timeoutSec, ca
 	local url = base .. "/eval?fen=" .. HttpService:UrlEncode(fen) .. "&depth=" .. tostring(d) .. "&multipv=" .. tostring(mpv)
 	if mt > 0 then
 		url = url .. "&movetime=" .. tostring(mt)
+	end
+	if isSpeculative then
+		url = url .. "&speculative=1"
 	end
 	local headers = { ["Accept"] = "application/json" }
 	if type(CONFIG.VpsApiKey) == "string" and CONFIG.VpsApiKey ~= "" then
@@ -1550,24 +1784,31 @@ local function queryVpsStockfish(fen, depth, movetimeMs, multipv, timeoutSec, ca
 		Url = url,
 		Method = "GET",
 		Headers = headers,
-	}, timeoutSec or 2.2, cancelFn)
+	}, timeoutSec or 2.0, cancelFn)
 	local ms = math.floor((os.clock() - t0) * 1000)
 
 	if res == "cancelled" then
 		return nil, "cancelled"
 	end
 	if not ok or type(res) ~= "table" or not res.Success or res.StatusCode ~= 200 then
-		STATE.VpsFailStreak += 1
-		if STATE.VpsFailStreak >= 2 then
-			STATE.VpsCooldownUntil = os.clock() + 12
+		if not noPenalty then
+			STATE.VpsFailStreak += 1
+			if STATE.VpsFailStreak >= 2 then
+				STATE.VpsCooldownUntil = os.clock() + 12
+			end
 		end
 		return nil, tostring(res)
 	end
 	local dok, data = pcall(HttpService.JSONDecode, HttpService, res.Body or "")
 	if not dok or type(data) ~= "table" or data.success ~= true then
-		STATE.VpsFailStreak += 1
-		if STATE.VpsFailStreak >= 2 then
-			STATE.VpsCooldownUntil = os.clock() + 12
+		if dok and type(data) == "table" and data.preempted == true then
+			return nil, "preempted"
+		end
+		if not noPenalty then
+			STATE.VpsFailStreak += 1
+			if STATE.VpsFailStreak >= 2 then
+				STATE.VpsCooldownUntil = os.clock() + 12
+			end
 		end
 		return nil, "bad_json"
 	end
@@ -1576,8 +1817,10 @@ local function queryVpsStockfish(fen, depth, movetimeMs, multipv, timeoutSec, ca
 	if not bestUci then
 		return nil, "no_move"
 	end
-	STATE.VpsFailStreak = 0
-	STATE.VpsCooldownUntil = 0
+	if not noPenalty then
+		STATE.VpsFailStreak = 0
+		STATE.VpsCooldownUntil = 0
+	end
 
 	local ponderUci = (type(data.ponder) == "string" and #data.ponder >= 4) and data.ponder
 		or string.match(tostring(data.bestmove or ""), "ponder%s+([a-h][1-8][a-h][1-8][qrbn]?)")
@@ -1659,7 +1902,7 @@ local function queryStockfishOnline(fen, depth, timeoutSec, cancelFn)
 		Url = url,
 		Method = "GET",
 		Headers = { ["Accept"] = "application/json" },
-	}, timeoutSec or 2.6, cancelFn)
+	}, timeoutSec or 2.4, cancelFn)
 	local ms = math.floor((os.clock() - t0) * 1000)
 
 	if res == "cancelled" then
@@ -1755,49 +1998,230 @@ local function queryLocalWs(fen, depth, cancelFn)
 	})
 end
 
--- GM Move Shaper: selects authentic GM/IM moves from MultiPV 3 while never missing critical tactics.
--- Automatically bypassed whenever Anti-Engine Turbo or an Engine Opponent is active!
+-- GM Move Shaper + Dynamic Auto-Adapt Strength:
+-- Selects authentic GM/Master moves from MultiPV 2/3 with proportional thresholds and eval-floor guards.
+-- Automatically escalates strength against sharp/engine opponents or worse positions, and de-escalates smoothly when winning.
 local GM_STYLE_PROFILES = {
-	SuperGM = { openGap = 25, midGap = 24, winGap = 40, endGap = 15, p2Close = 0.34, p3Close = 0.08, p2Med = 0.18, openW = { 58, 28, 14 } },
-	GM = { openGap = 32, midGap = 40, winGap = 60, endGap = 22, p2Close = 0.46, p3Close = 0.14, p2Med = 0.30, openW = { 46, 34, 20 } },
-	Master = { openGap = 42, midGap = 65, winGap = 90, endGap = 35, p2Close = 0.54, p3Close = 0.22, p2Med = 0.38, openW = { 38, 36, 26 } },
+	SuperGM = { openGap = 25, midGap = 26, winGap = 45, endGap = 18, p2Close = 0.36, p3Close = 0.09, p2Med = 0.20, openW = { 56, 30, 14 } },
+	GM = { openGap = 38, midGap = 52, winGap = 78, endGap = 30, p2Close = 0.50, p3Close = 0.16, p2Med = 0.34, openW = { 44, 34, 22 } },
+	Master = { openGap = 52, midGap = 85, winGap = 115, endGap = 48, p2Close = 0.58, p3Close = 0.24, p2Med = 0.42, openW = { 36, 36, 28 } },
 }
+local STYLE_TIERS = { "Master", "GM", "SuperGM", "Full" }
+local STYLE_TO_TIER = { Master = 1, GM = 2, SuperGM = 3, Full = 4 }
 
 local function isEdgePawnPush(uci)
 	return uci == "a2a3" or uci == "a2a4" or uci == "h2h3" or uci == "h2h4"
 		or uci == "a7a6" or uci == "a7a5" or uci == "h7h6" or uci == "h7h5"
 end
 
-local function applyGmMoveShaper(fen, session, rawRes, turbo)
+local function getEffectivePlayStyle(session, turbo, suspect, evalOverride, allowCommit)
+	local userStyle = CONFIG.PlayStyle or "GM"
+	local baseTier = STYLE_TO_TIER[userStyle] or 2
+	if userStyle == "Full" or not session or session.kind ~= "online" then
+		return userStyle, false
+	end
+
+	local o = STATE.Opp
+	if turbo or o.engineDetected or suspect then
+		if allowCommit and CONFIG.AutoAdapt then
+			o.adaptTier = 4
+			o.lastAdaptPly = (type(session.ucis) == "table") and #session.ucis or 0
+		end
+		return "Full", (CONFIG.AutoAdapt == true)
+	end
+
+	if not CONFIG.AutoAdapt then
+		return userStyle, false
+	end
+
+	local rate = (o.checked > 0) and (o.hits / o.checked) or 0
+	local myEval = (evalOverride ~= nil) and evalOverride or o.lastEvalForMe
+	local curTier = math.max(baseTier, o.adaptTier or baseTier)
+	local desiredTier = baseTier
+
+	if (o.checked >= 4 and rate >= 0.70) or (myEval ~= nil and myEval <= -150) then
+		desiredTier = 4
+	elseif (o.checked >= 3 and rate >= 0.60) or (myEval ~= nil and myEval <= -60) then
+		desiredTier = math.min(4, baseTier + 1)
+	end
+
+	local nextTier = curTier
+	if myEval ~= nil and myEval >= 200 and not o.engineDetected and not o.suspect and not turbo then
+		nextTier = math.max(baseTier, curTier - 1)
+	elseif desiredTier > curTier then
+		nextTier = desiredTier
+	end
+
+	if allowCommit then
+		local curPly = (type(session.ucis) == "table") and #session.ucis or 0
+		if o.lastAdaptPly ~= curPly or nextTier > (o.adaptTier or baseTier) then
+			o.adaptTier = nextTier
+			o.lastAdaptPly = curPly
+		else
+			nextTier = math.max(baseTier, o.adaptTier or baseTier)
+		end
+	end
+
+	local effStyle = STYLE_TIERS[nextTier] or userStyle
+	return effStyle, (effStyle ~= userStyle)
+end
+
+-- Shared Query Profile between live solvePosition and launchPonderPrefetch so (depth, movetime, multipv) match identically
+local function computeQueryProfile(session, turbo, suspect)
+	local myMs = (session and session.myColor) and getLiveClockMs(session, session.myColor) or nil
+	local vpsReady = hasVpsConfigured() and os.clock() >= STATE.VpsCooldownUntil
+	local effStyle, isAdapted = getEffectivePlayStyle(session, turbo, suspect, nil, false)
+	local baseMs = (session and session.kind == "online") and STATE.Opp.baseMs or nil
+	local isBullet1 = (baseMs ~= nil and baseMs <= 65000)
+
+	local sfDepth = CONFIG.StockfishDepth
+	local wantMultiPv = 1
+	if vpsReady
+		and not turbo
+		and not suspect
+		and not STATE.Opp.engineDetected
+		and effStyle ~= "Full"
+		and session
+		and (session.kind == "online" or session.kind == "bot")
+	then
+		if isBullet1 or (myMs and myMs < 12000) then
+			wantMultiPv = 1
+		elseif myMs and myMs < 25000 then
+			wantMultiPv = 2
+		else
+			wantMultiPv = 3
+		end
+	end
+
+	local vpsMoveTime = turbo and 95 or (suspect and 120 or (wantMultiPv == 3 and 300 or (wantMultiPv == 2 and 90 or 220)))
+	local vpsTimeout = turbo and 1.25 or 2.0
+	local sfTimeout = turbo and 0.90 or 1.50 -- post-VPS Cloud fallback timeout (aligned below Watchdog #1)
+	local sfStandaloneTimeout = turbo and 1.35 or 2.40
+	local luauTime = turbo and 0.24 or CONFIG.LuauTimeBudget
+	local lowClockSwitch = false
+
+	if turbo then
+		sfDepth = math.min(sfDepth, vpsReady and 16 or 11)
+	elseif suspect then
+		sfDepth = math.min(sfDepth, vpsReady and 16 or 12)
+	end
+
+	if myMs and session and session.kind == "online" then
+		local luauCutMs = vpsReady and 8000 or 15000
+		if myMs < luauCutMs and CONFIG.EngineMode == "Hybrid" then
+			lowClockSwitch = true
+			luauTime = 0.16
+		elseif myMs < 25000 then
+			if wantMultiPv == 2 then
+				vpsMoveTime = math.min(vpsMoveTime, 90)
+				vpsTimeout = math.min(vpsTimeout, 1.05)
+			else
+				vpsMoveTime = math.min(vpsMoveTime, 75)
+				vpsTimeout = math.min(vpsTimeout, 1.00)
+			end
+			sfDepth = math.min(sfDepth, vpsReady and 14 or 10)
+			sfTimeout = math.min(sfTimeout, 0.90)
+			sfStandaloneTimeout = math.min(sfStandaloneTimeout, 1.25)
+			luauTime = math.min(luauTime, 0.22)
+		elseif myMs < 40000 then
+			vpsMoveTime = math.min(vpsMoveTime, 150)
+			sfDepth = math.min(sfDepth, vpsReady and 15 or 11)
+		end
+	end
+
+	local cacheGroup = (wantMultiPv >= 3) and "sf3" or ((wantMultiPv == 2) and "sf2" or "sf")
+	return {
+		myMs = myMs,
+		vpsReady = vpsReady,
+		sfDepth = sfDepth,
+		wantMultiPv = wantMultiPv,
+		vpsMoveTime = vpsMoveTime,
+		vpsTimeout = vpsTimeout,
+		sfTimeout = sfTimeout,
+		sfStandaloneTimeout = sfStandaloneTimeout,
+		luauTime = luauTime,
+		lowClockSwitch = lowClockSwitch,
+		cacheGroup = cacheGroup,
+		effStyle = effStyle,
+		isAdapted = isAdapted,
+	}
+end
+
+local function lookupSfCache(f4, wantMultiPv, anyForLowClock)
+	if anyForLowClock or wantMultiPv <= 1 then
+		return STATE.Cache[f4 .. "|sf"] or STATE.Cache[f4 .. "|sf2"] or STATE.Cache[f4 .. "|sf3"]
+	elseif wantMultiPv == 2 then
+		return STATE.Cache[f4 .. "|sf2"] or STATE.Cache[f4 .. "|sf3"]
+	end
+	return STATE.Cache[f4 .. "|sf3"]
+end
+
+local function deriveResultCacheGroup(res)
+	if not res then
+		return "luau"
+	end
+	if res.source == "VpsSF" then
+		local mpv = tonumber(res.multipv) or (type(res.lines) == "table" and #res.lines or 1)
+		if mpv >= 3 then return "sf3" end
+		if mpv == 2 then return "sf2" end
+		return "sf"
+	elseif res.source == "Stockfish" or res.source == "LocalSF" then
+		return "sf"
+	end
+	return "luau"
+end
+
+local function applyGmMoveShaper(fen, session, rawRes, turbo, suspect)
 	if not rawRes then
 		return nil
 	end
 	local out = table.clone(rawRes)
-	local style = CONFIG.PlayStyle or "GM"
-	local prof = GM_STYLE_PROFILES[style]
-	if not prof or turbo or STATE.Opp.engineDetected then
-		return out
-	end
 	if not session or (session.kind ~= "online" and session.kind ~= "bot") then
 		return out
 	end
 	if session.myColor ~= nil and not session:isMyTurn() then
 		return out
 	end
-	if type(rawRes.lines) ~= "table" or #rawRes.lines < 2 then
-		return out
-	end
 
 	local fenParts = string.split(fen, " ")
 	local side = (fenParts[2] == "b") and -1 or 1
-	local pv1 = rawRes.lines[1]
-	if not pv1 or pv1.mate ~= nil then
-		-- Never deviate from forced mate sequences
+	local pv1 = (type(rawRes.lines) == "table" and rawRes.lines[1]) or nil
+	local rawTopCp = (pv1 and pv1.evalCp) or rawRes.evalCp or 0
+	local myEval1 = rawTopCp * side
+
+	local effStyle, isAdapted = getEffectivePlayStyle(session, turbo, suspect, myEval1, true)
+	local baseName = (rawRes.source == "VpsSF") and ((rawRes.engineName or "Stockfish 19") .. " VPS")
+		or (rawRes.engineLabel or rawRes.source or "Stockfish")
+
+	local prof = GM_STYLE_PROFILES[effStyle]
+	if not prof or turbo or STATE.Opp.engineDetected or suspect then
+		if isAdapted and rawRes.source == "VpsSF" then
+			out.gmRank = 1
+			out.gmLossCp = 0
+			out.engineLabel = string.format("%s · Auto→Full (PV1)", baseName)
+			out.engineKind = (turbo or STATE.Opp.engineDetected) and "turbo" or "vpssf"
+		end
 		return out
 	end
 
-	local myEval1 = (pv1.evalCp or 0) * side
-	local ply = (session.ucis and #session.ucis) or 0
+	if type(rawRes.lines) ~= "table" or #rawRes.lines < 2 or not pv1 then
+		if isAdapted and rawRes.source == "VpsSF" then
+			out.engineLabel = string.format("%s · Auto→%s (PV1)", baseName, effStyle)
+		end
+		return out
+	end
+
+	if pv1.mate ~= nil then
+		-- Never deviate from forced mate sequences
+		out.gmRank = 1
+		out.gmLossCp = 0
+		out.engineLabel = isAdapted and string.format("%s · Auto→%s (PV1)", baseName, effStyle)
+			or string.format("%s · %s (PV1)", baseName, effStyle)
+		out.engineKind = "gm"
+		return out
+	end
+
+	local ply = (type(session.ucis) == "table") and #session.ucis or 0
 	local totalPieces = countFenPieces(fen)
 
 	local function getGap(ln)
@@ -1805,6 +2229,21 @@ local function applyGmMoveShaper(fen, session, rawRes, turbo)
 			return 99999
 		end
 		return math.max(0, myEval1 - ((ln.evalCp or 0) * side))
+	end
+
+	-- Eval-floor guard: wider GM/Master gaps never throw away a clearly winning game or blunder into a lost position
+	local function isSafeCandidate(ln)
+		if not ln or ln.mate ~= nil then
+			return false
+		end
+		local candEval = (ln.evalCp or 0) * side
+		if myEval1 >= 150 and candEval < 60 then
+			return false
+		end
+		if myEval1 >= -60 and candEval < -160 then
+			return false
+		end
+		return true
 	end
 
 	local pv2 = rawRes.lines[2]
@@ -1817,10 +2256,10 @@ local function applyGmMoveShaper(fen, session, rawRes, turbo)
 	if ply <= 7 then
 		-- Opening repertoire diversity (e4/d4/Nf3/c4, Sicilian/e5/Caro-Kann/etc.)
 		local cands = { { ln = pv1, w = prof.openW[1], g = 0 } }
-		if pv2 and gap2 <= prof.openGap then
+		if pv2 and gap2 <= prof.openGap and isSafeCandidate(pv2) then
 			table.insert(cands, { ln = pv2, w = prof.openW[2], g = gap2 })
 		end
-		if pv3 and gap3 <= prof.openGap then
+		if pv3 and gap3 <= prof.openGap and isSafeCandidate(pv3) then
 			table.insert(cands, { ln = pv3, w = prof.openW[3], g = gap3 })
 		end
 		local totalW = 0
@@ -1840,23 +2279,27 @@ local function applyGmMoveShaper(fen, session, rawRes, turbo)
 			or ((myEval1 >= 180) and prof.winGap or prof.midGap)
 		if myEval1 < -120 then
 			-- Tighten precision while defending so we don't collapse
-			maxGap = math.floor(maxGap * 0.5)
+			maxGap = math.max(10, math.floor(maxGap * 0.5))
 		end
 
-		if pv2 and gap2 <= maxGap then
+		local closeCut = math.max(6, math.floor(maxGap * 0.40))
+		local medCut = math.max(closeCut + 2, math.floor(maxGap * 0.72))
+
+		if pv2 and gap2 <= maxGap and isSafeCandidate(pv2) then
 			local r = math.random()
-			local edgeBonus = (gap2 <= 18 and isEdgePawnPush(pv1.best) and not isEdgePawnPush(pv2.best)) and 0.16 or 0
-			if gap2 <= 16 then
-				local p3 = (pv3 and gap3 <= math.min(maxGap, 20)) and prof.p3Close or 0
-				local p2 = math.min(0.68, prof.p2Close + edgeBonus)
+			local edgeBonus = (gap2 <= closeCut and isEdgePawnPush(pv1.best) and not isEdgePawnPush(pv2.best)) and 0.16 or 0
+			local pv3Ok = pv3 and isSafeCandidate(pv3)
+			if gap2 <= closeCut then
+				local p3 = (pv3Ok and gap3 <= math.min(maxGap, medCut)) and prof.p3Close or 0
+				local p2 = math.min(0.70, prof.p2Close + edgeBonus)
 				if r < p3 then
 					picked, pickedGap = pv3, gap3
 				elseif r < p3 + p2 then
 					picked, pickedGap = pv2, gap2
 				end
-			elseif gap2 <= math.floor(maxGap * 0.72) then
-				local p3 = (pv3 and gap3 <= maxGap) and (prof.p3Close * 0.55) or 0
-				local p2 = math.min(0.55, prof.p2Med + edgeBonus)
+			elseif gap2 <= medCut then
+				local p3 = (pv3Ok and gap3 <= maxGap) and (prof.p3Close * 0.55) or 0
+				local p2 = math.min(0.56, prof.p2Med + edgeBonus)
 				if r < p3 then
 					picked, pickedGap = pv3, gap3
 				elseif r < p3 + p2 then
@@ -1870,7 +2313,7 @@ local function applyGmMoveShaper(fen, session, rawRes, turbo)
 		end
 	end
 
-	local baseName = (rawRes.engineName or "Stockfish 19") .. " VPS"
+	local styleTag = isAdapted and ("Auto→" .. effStyle) or effStyle
 	if picked.rank and picked.rank > 1 then
 		out.best = picked.best
 		out.ponder = picked.ponder
@@ -1883,20 +2326,21 @@ local function applyGmMoveShaper(fen, session, rawRes, turbo)
 		out = enrichMoveInfo(fen, out) or out
 		out.gmRank = picked.rank
 		out.gmLossCp = pickedGap
-		out.engineLabel = string.format("%s · %s (PV%d -%dcp)", baseName, style, picked.rank, pickedGap)
+		out.engineLabel = string.format("%s · %s (PV%d -%dcp)", baseName, styleTag, picked.rank, pickedGap)
 		out.engineKind = "gm"
 	else
 		out.gmRank = 1
 		out.gmLossCp = 0
-		out.engineLabel = string.format("%s · %s (PV1)", baseName, style)
+		out.engineLabel = string.format("%s · %s (PV1)", baseName, styleTag)
 		out.engineKind = "gm"
 	end
 	return out
 end
 
 -- Speculative Ponder Prefetch: solve the position AFTER opponent's expected Stockfish reply during their turn!
-local function launchPonderPrefetch(curFen, ponderUci)
-	if not CONFIG.AntiEngineTurbo or not CONFIG.Enabled or STATE.PrefetchInFlight then
+-- Uses VPS speculative=1 (preemptible server-side), NEVER runs Cloud fallback, NEVER mutates FailStreaks.
+local function launchPonderPrefetch(curFen, ponderUci, session)
+	if not CONFIG.AntiEngineTurbo or not CONFIG.Enabled then
 		return
 	end
 	if type(ponderUci) ~= "string" or #ponderUci < 4 then
@@ -1905,11 +2349,10 @@ local function launchPonderPrefetch(curFen, ponderUci)
 	if CONFIG.EngineMode == "Luau" then
 		return
 	end
-	local useVps = hasVpsConfigured() and os.clock() >= STATE.VpsCooldownUntil
-	local useCloud = os.clock() >= STATE.SfCooldownUntil
-	if not useVps and not useCloud then
+	if not hasVpsConfigured() or os.clock() < STATE.VpsCooldownUntil then
 		return
 	end
+
 	local b = PureChess.new(curFen)
 	local pm = b:moveFromUci(ponderUci)
 	if not pm then
@@ -1917,43 +2360,49 @@ local function launchPonderPrefetch(curFen, ponderUci)
 	end
 	b:makeMove(pm)
 	local nextFen = b:getFen()
-	local isTurbo = STATE.Opp.turboActive or STATE.Opp.engineDetected
-	local wantMpv = (useVps and not isTurbo and CONFIG.PlayStyle ~= "Full") and 3 or 1
-	local cGroup = (wantMpv > 1) and "sf3" or "sf"
-	local cKey = fenCacheKey(nextFen, cGroup)
-	if STATE.Cache[cKey] or STATE.PrefetchKey == cKey then
+	local f4 = fen4Key(nextFen)
+
+	local turbo = CONFIG.AntiEngineTurbo and (STATE.Opp.turboActive or STATE.Opp.engineDetected)
+	local suspect = CONFIG.AntiEngineTurbo and STATE.Opp.suspect
+	local prof = computeQueryProfile(session, turbo, suspect)
+	local cKey = f4 .. "|" .. prof.cacheGroup
+
+	if lookupSfCache(f4, prof.wantMultiPv, false) then
+		return
+	end
+	if STATE.PrefetchDone and not STATE.PrefetchDone.done and STATE.PrefetchFen4 == f4 and STATE.PrefetchKey == cKey then
 		return
 	end
 
+	STATE.PrefetchGen += 1
+	local myPGen = STATE.PrefetchGen
+	local pBox = { done = false, res = nil, fen4 = f4, cacheKey = cKey, gen = myPGen }
 	STATE.PrefetchKey = cKey
-	STATE.PrefetchInFlight = true
-	local d = isTurbo and math.min(CONFIG.StockfishDepth, 15) or CONFIG.StockfishDepth
+	STATE.PrefetchFen4 = f4
+	STATE.PrefetchDone = pBox
 
 	task.spawn(function()
 		local cancelPrefetch = function()
-			return (not STATE.Alive) or (STATE.PrefetchKey ~= cKey)
+			return (not STATE.Alive) or (STATE.PrefetchGen ~= myPGen)
 		end
-		local res = nil
-		if useVps then
-			res = queryVpsStockfish(nextFen, d, isTurbo and 115 or 260, wantMpv, 2.0, cancelPrefetch)
-		end
-		if not res and useCloud and not cancelPrefetch() then
-			res = queryStockfishOnline(nextFen, math.min(d, 15), 2.4, cancelPrefetch)
-		end
+		local res = queryVpsStockfish(
+			nextFen,
+			prof.sfDepth,
+			prof.vpsMoveTime,
+			prof.wantMultiPv,
+			math.min(prof.vpsTimeout, 1.8),
+			cancelPrefetch,
+			{ speculative = true, noPenalty = true }
+		)
 		if res and STATE.Alive then
-			if res.source == "VpsSF" then
-				res.engineLabel = (res.engineName or "Stockfish 19") .. " VPS (Ponder Hit)"
-				res.engineKind = "vpssf"
-			else
-				res.engineLabel = "Stockfish Cloud (Ponder Hit)"
-				res.engineKind = "stockfish"
-			end
+			res.engineLabel = (res.engineName or "Stockfish 19") .. " VPS (Ponder Hit)"
+			res.engineKind = "vpssf"
 			res.prefetched = true
-			cachePut(cKey, res)
+			local actualGrp = deriveResultCacheGroup(res)
+			cachePut(f4 .. "|" .. actualGrp, res)
+			pBox.res = res
 		end
-		if STATE.PrefetchKey == cKey then
-			STATE.PrefetchInFlight = false
-		end
+		pBox.done = true
 	end)
 end
 
@@ -1961,10 +2410,13 @@ local function solvePosition(fen, session, gen, onStage)
 	local function isCancelled()
 		return (not STATE.Alive) or (gen ~= STATE.SearchGen)
 	end
-	local function reportStage(label, kind)
+	local function reportStage(label, kind, stageTag)
 		if isCancelled() then return end
 		STATE.ActiveEngine = label
 		STATE.ActiveEngineKind = kind or "thinking"
+		if stageTag ~= nil then
+			STATE.ActiveStage = stageTag
+		end
 		if onStage then
 			onStage(label, kind)
 		end
@@ -1989,84 +2441,91 @@ local function solvePosition(fen, session, gen, onStage)
 					engineKind = "puzzle",
 				})
 				if enriched then
+					if not isCancelled() then
+						STATE.ActiveStage = nil
+					end
 					return enriched
 				end
 			end
 		end
 	end
 
-	-- Adaptive clock & Anti-Engine Turbo routing
-	local myMs = nil
-	if session and session.clocks and session.myColor then
-		myMs = session.clocks[session.myColor]
-	end
 	local turbo = CONFIG.AntiEngineTurbo and STATE.Opp.turboActive and session and session.kind == "online"
-	local mode = CONFIG.EngineMode
-	local sfDepth = CONFIG.StockfishDepth
-	local vpsReady = hasVpsConfigured() and os.clock() >= STATE.VpsCooldownUntil
-	local wantMultiPv = (vpsReady and not turbo and not STATE.Opp.engineDetected
-		and CONFIG.PlayStyle ~= "Full"
-		and session and (session.kind == "online" or session.kind == "bot")
-		and (not myMs or myMs >= 25000)) and 3 or 1
-	local vpsMoveTime = turbo and 95 or (wantMultiPv > 1 and 300 or 260)
-	local vpsTimeout = turbo and 1.25 or 2.2
-	local sfTimeout = turbo and 1.35 or 2.6
-	local luauTime = turbo and 0.28 or CONFIG.LuauTimeBudget
-	local lowClockSwitch = false
+	local suspect = CONFIG.AntiEngineTurbo and STATE.Opp.suspect and session and session.kind == "online"
+	local prof = computeQueryProfile(session, turbo, suspect)
+	local liveF4 = fen4Key(fen)
 
-	if turbo then
-		sfDepth = math.min(sfDepth, vpsReady and 16 or 11)
+	local function finalizeCacheHit(sfHit, waitMs)
+		local hitCopy = applyGmMoveShaper(fen, session, sfHit, turbo, suspect)
+		hitCopy.ms = waitMs or 0
+		if sfHit.prefetched then
+			local baseLbl = hitCopy.engineLabel or ((sfHit.source == "VpsSF") and "Stockfish 19 VPS" or "Stockfish")
+			if not string.find(baseLbl, "Ponder", 1, true) then
+				hitCopy.engineLabel = baseLbl .. " · Ponder Hit"
+			end
+		else
+			local baseLbl = hitCopy.engineLabel or "Stockfish"
+			if not string.find(baseLbl, "Cached", 1, true) then
+				hitCopy.engineLabel = baseLbl .. " (Cached)"
+			end
+		end
+		if not isCancelled() then
+			STATE.ActiveStage = nil
+		end
+		return hitCopy
 	end
-	if myMs and session.kind == "online" then
-		local luauCutMs = vpsReady and 8000 or 15000
-		if myMs < luauCutMs and mode == "Hybrid" then
-			mode = "Luau"
-			luauTime = 0.16
-			lowClockSwitch = true
-		elseif myMs < 25000 then
-			wantMultiPv = 1
-			vpsMoveTime = math.min(vpsMoveTime, 75)
-			vpsTimeout = math.min(vpsTimeout, 1.0)
-			sfDepth = math.min(sfDepth, vpsReady and 14 or 10)
-			sfTimeout = math.min(sfTimeout, 1.3)
-			luauTime = math.min(luauTime, 0.25)
-		elseif myMs < 40000 then
-			vpsMoveTime = math.min(vpsMoveTime, 150)
-			sfDepth = math.min(sfDepth, vpsReady and 15 or 11)
+
+	-- 1. Check Ponder/Stockfish cache BEFORE lowClockSwitch so 0ms SF19 ponder hits ALWAYS win under < 8s!
+	if CONFIG.EngineMode ~= "Luau" then
+		local sfHit = lookupSfCache(liveF4, prof.wantMultiPv, prof.lowClockSwitch)
+		if sfHit then
+			return finalizeCacheHit(sfHit, 0)
+		end
+
+		-- 2. If a matching speculative prefetch is already in-flight for this live fen4, await up to 0.65s (0.35s under <8s)
+		local pBox = STATE.PrefetchDone
+		if pBox and not pBox.done and pBox.fen4 == liveF4 then
+			local tAwait0 = os.clock()
+			local awaitLimit = prof.lowClockSwitch and 0.35 or 0.65
+			local awaitUntil = tAwait0 + awaitLimit
+			reportStage("Stockfish 19 VPS (Ponder)", "thinking", "vps")
+			while (not pBox.done) and (not isCancelled()) and os.clock() < awaitUntil do
+				task.wait(0.02)
+			end
+			if isCancelled() then
+				return nil
+			end
+			local awaitedHit = pBox.res or lookupSfCache(liveF4, prof.wantMultiPv, prof.lowClockSwitch)
+			if awaitedHit then
+				local actualMpv = tonumber(awaitedHit.multipv) or 1
+				if prof.lowClockSwitch or prof.wantMultiPv <= 1 or actualMpv >= prof.wantMultiPv then
+					return finalizeCacheHit(awaitedHit, math.floor((os.clock() - tAwait0) * 1000))
+				end
+			end
+		elseif pBox and not pBox.done and pBox.fen4 ~= liveF4 then
+			-- Non-matching speculative prefetch: cancel client-side immediately so live request preempts cleanly
+			cancelPrefetchState()
 		end
 	end
 
-	-- Check Ponder/Stockfish cache FIRST (instant 0ms ponder hit; GM Shaper runs fresh per turn!)
-	if mode ~= "Luau" then
-		local sfHit = (wantMultiPv > 1 and STATE.Cache[fenCacheKey(fen, "sf3")])
-			or (wantMultiPv == 1 and (STATE.Cache[fenCacheKey(fen, "sf")] or STATE.Cache[fenCacheKey(fen, "sf3")]))
-		if sfHit then
-			local hitCopy = applyGmMoveShaper(fen, session, sfHit, turbo)
+	-- 3. Apply lowClockSwitch (< 8s) only AFTER cache + active ponder check missed
+	local mode = prof.lowClockSwitch and "Luau" or CONFIG.EngineMode
+	if mode == "Luau" then
+		local luauHit = STATE.Cache[fenCacheKey(fen, "luau")]
+		if luauHit then
+			local hitCopy = table.clone(luauHit)
 			hitCopy.ms = 0
-			if sfHit.prefetched then
-				local baseLbl = hitCopy.engineLabel or ((sfHit.source == "VpsSF") and "Stockfish 19 VPS" or "Stockfish")
-				if not string.find(baseLbl, "Ponder", 1, true) then
-					hitCopy.engineLabel = baseLbl .. " · Ponder Hit"
-				end
-			else
-				local baseLbl = hitCopy.engineLabel or "Stockfish"
-				if not string.find(baseLbl, "Cached", 1, true) then
-					hitCopy.engineLabel = baseLbl .. " (Cached)"
-				end
+			if not isCancelled() then
+				STATE.ActiveStage = nil
 			end
 			return hitCopy
 		end
 	end
-	local luauHit = (mode == "Luau") and STATE.Cache[fenCacheKey(fen, "luau")]
-	if luauHit then
-		local hitCopy = table.clone(luauHit)
-		hitCopy.ms = 0
-		return hitCopy
-	end
 
 	local function runLuau(tagLabel, tagKind)
-		reportStage(tagLabel, "thinking")
-		local r = enrichMoveInfo(fen, PureChess.search(fen, CONFIG.LuauMaxDepth, luauTime, isCancelled))
+		reportStage(tagLabel, "thinking", "luau")
+		local recentUcis = (session and type(session.ucis) == "table") and session.ucis or nil
+		local r = enrichMoveInfo(fen, PureChess.search(fen, CONFIG.LuauMaxDepth, prof.luauTime, isCancelled, recentUcis))
 		if r then
 			if r.source == "Book" then
 				r.engineLabel = "Opening Book (Luau)"
@@ -2081,22 +2540,22 @@ local function solvePosition(fen, session, gen, onStage)
 
 	local res = nil
 	if mode == "LocalWS" then
-		reportStage("Local Stockfish WS", "thinking")
-		res = queryLocalWs(fen, sfDepth, isCancelled)
+		reportStage("Local Stockfish WS", "thinking", "ws")
+		res = queryLocalWs(fen, prof.sfDepth, isCancelled)
 		if res then
 			res.engineLabel = "Local Stockfish WS"
 			res.engineKind = "localws"
-		elseif not isCancelled() and vpsReady then
-			reportStage("Stockfish 19 VPS (WS Fallback)", "thinking")
-			res = queryVpsStockfish(fen, sfDepth, vpsMoveTime, wantMultiPv, vpsTimeout, isCancelled)
+		elseif not isCancelled() and prof.vpsReady then
+			reportStage("Stockfish 19 VPS (WS Fallback)", "thinking", "vps")
+			res = queryVpsStockfish(fen, prof.sfDepth, prof.vpsMoveTime, prof.wantMultiPv, prof.vpsTimeout, isCancelled)
 			if res then
 				res.engineLabel = (res.engineName or "Stockfish 19") .. " VPS (WS Fallback)"
 				res.engineKind = "vpssf"
 			end
 		end
 		if not res and not isCancelled() then
-			reportStage("Stockfish Cloud (WS Fallback)", "thinking")
-			res = queryStockfishOnline(fen, math.min(sfDepth, 15), sfTimeout, isCancelled)
+			reportStage("Stockfish Cloud (WS Fallback)", "thinking", "cloud")
+			res = queryStockfishOnline(fen, math.min(prof.sfDepth, 15), prof.sfTimeout, isCancelled)
 			if res then
 				res.engineLabel = "Stockfish Cloud (WS Fallback)"
 				res.engineKind = "stockfish"
@@ -2106,11 +2565,14 @@ local function solvePosition(fen, session, gen, onStage)
 		end
 	elseif mode == "Stockfish" or mode == "Hybrid" then
 		local vpsAttempted = false
-		if vpsReady then
+		if prof.vpsReady then
 			vpsAttempted = true
-			local vpsTag = turbo and "Stockfish 19 VPS (Turbo)" or (wantMultiPv > 1 and ("Stockfish 19 VPS · " .. CONFIG.PlayStyle) or "Stockfish 19 VPS")
-			reportStage(vpsTag, "thinking")
-			res = queryVpsStockfish(fen, sfDepth, vpsMoveTime, wantMultiPv, vpsTimeout, isCancelled)
+			local styleLbl = prof.isAdapted and ("Auto→" .. prof.effStyle) or prof.effStyle
+			local vpsTag = turbo and "Stockfish 19 VPS (Turbo)"
+				or (prof.wantMultiPv > 1 and ("Stockfish 19 VPS · " .. styleLbl)
+					or (prof.isAdapted and ("Stockfish 19 VPS · " .. styleLbl) or "Stockfish 19 VPS"))
+			reportStage(vpsTag, "thinking", "vps")
+			res = queryVpsStockfish(fen, prof.sfDepth, prof.vpsMoveTime, prof.wantMultiPv, prof.vpsTimeout, isCancelled)
 			if res then
 				local nm = res.engineName or "Stockfish 19"
 				res.engineLabel = turbo and (nm .. " VPS (Turbo)") or (nm .. " VPS")
@@ -2121,8 +2583,9 @@ local function solvePosition(fen, session, gen, onStage)
 		if not res and not isCancelled() then
 			if os.clock() >= STATE.SfCooldownUntil then
 				local cloudTag = vpsAttempted and "Stockfish Cloud (VPS Fallback)" or (turbo and "Stockfish Turbo" or "Stockfish Cloud")
-				reportStage(cloudTag, "thinking")
-				res = queryStockfishOnline(fen, math.min(sfDepth, 15), sfTimeout, isCancelled)
+				reportStage(cloudTag, "thinking", "cloud")
+				local cloudTimeout = vpsAttempted and prof.sfTimeout or prof.sfStandaloneTimeout
+				res = queryStockfishOnline(fen, math.min(prof.sfDepth, 15), cloudTimeout, isCancelled)
 				if res then
 					res.engineLabel = cloudTag
 					res.engineKind = turbo and "turbo" or "stockfish"
@@ -2134,14 +2597,16 @@ local function solvePosition(fen, session, gen, onStage)
 			res = runLuau("Offline Luau (API Fallback)", "fallback")
 		end
 	else -- "Luau" (or Hybrid low-clock switch)
-		res = runLuau(lowClockSwitch and "Offline Luau (Low Clock)" or "Offline Luau", lowClockSwitch and "fallback" or "luau")
+		res = runLuau(prof.lowClockSwitch and "Offline Luau (Low Clock)" or "Offline Luau", prof.lowClockSwitch and "fallback" or "luau")
 	end
 
-	if res and not isCancelled() then
-		local grp = (res.source == "VpsSF" and res.multipv and res.multipv > 1) and "sf3"
-			or ((res.source == "VpsSF" or res.source == "Stockfish" or res.source == "LocalSF") and "sf" or "luau")
-		cachePut(fenCacheKey(fen, grp), res)
-		res = applyGmMoveShaper(fen, session, res, turbo)
+	if not isCancelled() then
+		STATE.ActiveStage = nil
+		if res then
+			local grp = deriveResultCacheGroup(res)
+			cachePut(fenCacheKey(fen, grp), res)
+			res = applyGmMoveShaper(fen, session, res, turbo, suspect)
+		end
 	end
 	return res
 end
@@ -2387,6 +2852,7 @@ local function clearArrows()
 		end
 	end
 	table.clear(activeArrows)
+	STATE.LastArrowSig = ""
 end
 
 local function drawBoardArrow(fromSq, toSq, flipped, sqPx, color, transparency, zOrder)
@@ -2592,6 +3058,10 @@ end
 
 local Library, libErr = loadRemoteLua("Library.lua")
 if not Library then
+	pcall(function() overlayGui:Destroy() end)
+	if arrowHeadImageObj then
+		pcall(function() arrowHeadImageObj:Destroy() end)
+	end
 	error("[BeverlyHub] Failed to load BeverlyLIB: " .. tostring(libErr))
 end
 local ThemeManager = loadRemoteLua("addons/ThemeManager.lua")
@@ -2622,6 +3092,20 @@ local Tabs = {
 local triggerRecalc -- forward declaration
 local performSafeAutoMove -- forward declaration
 local cleanup -- forward declaration
+
+local recalcQueued = false
+local function scheduleRecalc()
+	if recalcQueued then
+		return
+	end
+	recalcQueued = true
+	task.defer(function()
+		recalcQueued = false
+		if STATE.Alive and STATE.App and triggerRecalc then
+			triggerRecalc(true)
+		end
+	end)
+end
 
 local function hasLayer(map, name)
 	if type(map) ~= "table" then
@@ -2657,6 +3141,7 @@ local function syncConfigFromUI()
 	if Options.PlayStyle and type(Options.PlayStyle.Value) == "string" then
 		CONFIG.PlayStyle = Options.PlayStyle.Value
 	end
+	CONFIG.AutoAdapt = (Toggles.AutoAdapt == nil) or (Toggles.AutoAdapt.Value == true)
 	if Options.StockfishDepth and tonumber(Options.StockfishDepth.Value) then
 		CONFIG.StockfishDepth = math.clamp(math.floor(tonumber(Options.StockfishDepth.Value)), 8, 18)
 	end
@@ -2692,6 +3177,7 @@ local function syncConfigFromUI()
 	if Options.AutoFindTc and type(Options.AutoFindTc.Value) == "string" then
 		CONFIG.AutoFindTc = Options.AutoFindTc.Value
 	end
+	CONFIG.AutoReloadOnTeleport = (Toggles.AutoReloadOnTeleport == nil) or (Toggles.AutoReloadOnTeleport.Value == true)
 	STATE.LastArrowSig = ""
 end
 
@@ -2826,13 +3312,13 @@ AnalysisBox:AddDropdown("PlayStyle", {
 		Full = "Full Engine (~3500 · PV1)",
 	},
 	Default = "GM",
-	Tooltip = "Uses VPS MultiPV 3 to play authentic GM/Master moves & opening variety. Automatically switches to Full Engine when an engine opponent is detected.",
+	Tooltip = "Uses VPS MultiPV 2/3 to play authentic GM/Master moves & opening variety. Automatically adapts strength against sharp or engine opponents.",
 })
 
 AnalysisBox:AddToggle("AntiEngineTurbo", {
 	Text = "Anti-Engine Turbo",
 	Default = true,
-	Tooltip = "Detects engine opponents via Stockfish agreement & cadence, prefetches ponder replies during their turn (0ms), and switches to fast pacing when matched or down on time.",
+	Tooltip = "Detects engine opponents early via Stockfish agreement & cadence, prefetches ponder replies during their turn (0ms), and switches to fast pacing when matched or down on time.",
 })
 
 AnalysisBox:AddToggle("OnlyMyTurn", {
@@ -2847,6 +3333,26 @@ AnalysisBox:AddButton("Recalculate", function()
 	STATE.VpsFailStreak = 0
 	STATE.SfCooldownUntil = 0
 	STATE.SfFailStreak = 0
+	STATE.AutoGen += 1
+	STATE.AutoPending = false
+	STATE.LastAutoKey = ""
+	STATE.AutoRetryAfter = 0
+	cancelPrefetchState()
+	local app = STATE.App
+	local sess = app and app.session
+	if sess and sess.engine then
+		local eng = (sess.kind == "analysis" or sess.kind == "review") and sess:engineAt(sess.viewPly) or sess.engine
+		if eng and type(eng.getFen) == "function" then
+			local okF, fStr = pcall(eng.getFen, eng)
+			if okF and type(fStr) == "string" then
+				local f4 = fen4Key(fStr)
+				STATE.Cache[f4 .. "|sf"] = nil
+				STATE.Cache[f4 .. "|sf2"] = nil
+				STATE.Cache[f4 .. "|sf3"] = nil
+				STATE.Cache[f4 .. "|luau"] = nil
+			end
+		end
+	end
 	if triggerRecalc then
 		triggerRecalc(true)
 	end
@@ -2854,10 +3360,15 @@ end):AddButton("Clear Cache", function()
 	table.clear(STATE.Cache)
 	table.clear(STATE.CacheOrder)
 	PureChess.clearTT()
+	cancelPrefetchState()
 	STATE.VpsCooldownUntil = 0
 	STATE.VpsFailStreak = 0
 	STATE.SfCooldownUntil = 0
 	STATE.SfFailStreak = 0
+	STATE.AutoGen += 1
+	STATE.AutoPending = false
+	STATE.LastAutoKey = ""
+	STATE.AutoRetryAfter = 0
 	Library:Notify({ Title = "Cache Cleared", Description = "Position cache, TT, and API cooldowns reset.", Time = 2.5 })
 	if triggerRecalc then
 		triggerRecalc(true)
@@ -2875,6 +3386,12 @@ MenuGroup:AddLabel("Menu Keybind"):AddKeyPicker("MenuKeybind", {
 	Default = "RightShift",
 	NoUI = true,
 	Text = "Menu Keybind",
+})
+
+MenuGroup:AddToggle("AutoReloadOnTeleport", {
+	Text = "Auto-Reload on Teleport",
+	Default = true,
+	Tooltip = "Automatically re-queues BeverlyHub via queue_on_teleport when RoChess teleports into a cross-server match.",
 })
 
 MenuGroup:AddSlider("LuauDepth", {
@@ -2907,10 +3424,16 @@ MenuGroup:AddInput("LocalWsUrl", {
 
 MenuGroup:AddDivider("Smart Delay Pacing")
 
+MenuGroup:AddToggle("AutoAdapt", {
+	Text = "Auto-Adapt Strength",
+	Default = true,
+	Tooltip = "Dynamically escalates Play Style (+1 tier vs sharp opponents or eval <= -0.6; straight to Full vs Suspect/Engine/Turbo or eval <= -1.5) and smoothly eases back when comfortably winning (+2.0+).",
+})
+
 MenuGroup:AddToggle("SmartDelay", {
 	Text = "Smart Phase Delay",
 	Default = true,
-	Tooltip = "Fast moves in opening, forced tactics, recaptures, and endgames; normal randomized delay in middlegame.",
+	Tooltip = "Fast moves in opening, forced tactics, recaptures, and endgames; TC-scaled randomized delay in middlegame.",
 })
 
 MenuGroup:AddSlider("FastOpeningMoves", {
@@ -2943,7 +3466,7 @@ MenuGroup:AddSlider("MaxClockLead", {
 	Rounding = 0,
 	Suffix = "s",
 	Compact = true,
-	Tooltip = "Caps how far ahead your clock stays vs your opponent (0 = off). Naturally thinks longer if ahead by more than N seconds (paused in Turbo or low clock).",
+	Tooltip = "Caps how far ahead your clock stays vs your opponent (0 = off). Automatically skipped in Bullet, openings, forced moves, recaptures, Suspect, or Turbo.",
 })
 
 MenuGroup:AddDivider()
@@ -2960,57 +3483,78 @@ MenuGroup:AddButton({
 
 Library.ToggleKeybind = Options.MenuKeybind
 
--- Hook UI callbacks
+-- Hook UI callbacks (debounced with 1-frame coalescing so SaveManager autoload never triggers HTTP storms)
 Toggles.BoardAssist:OnChanged(function()
 	syncConfigFromUI()
-	if triggerRecalc then triggerRecalc(true) end
+	scheduleRecalc()
 end)
 Options.ArrowColor:OnChanged(syncConfigFromUI)
 Options.VisualLayers:OnChanged(syncConfigFromUI)
 Options.EngineMode:OnChanged(function()
 	syncConfigFromUI()
-	if triggerRecalc then triggerRecalc(true) end
+	scheduleRecalc()
 end)
 Options.PlayStyle:OnChanged(function()
+	STATE.Opp.adaptTier = nil
+	STATE.Opp.lastAdaptPly = -1
 	syncConfigFromUI()
-	if triggerRecalc then triggerRecalc(true) end
+	scheduleRecalc()
+end)
+Toggles.AutoAdapt:OnChanged(function()
+	syncConfigFromUI()
+	if not CONFIG.AutoAdapt then
+		STATE.Opp.adaptTier = nil
+		STATE.Opp.lastAdaptPly = -1
+	end
+	scheduleRecalc()
 end)
 Options.StockfishDepth:OnChanged(function()
 	syncConfigFromUI()
-	if triggerRecalc then triggerRecalc(true) end
+	scheduleRecalc()
 end)
 Options.LuauDepth:OnChanged(function()
 	syncConfigFromUI()
-	if CONFIG.EngineMode == "Luau" and triggerRecalc then triggerRecalc(true) end
+	if CONFIG.EngineMode == "Luau" then
+		scheduleRecalc()
+	end
 end)
 Options.VpsApiUrl:OnChanged(function()
 	syncConfigFromUI()
 	STATE.VpsCooldownUntil = 0
 	STATE.VpsFailStreak = 0
-	if triggerRecalc then triggerRecalc(true) end
+	scheduleRecalc()
 end)
 Options.LocalWsUrl:OnChanged(syncConfigFromUI)
 Toggles.OnlyMyTurn:OnChanged(function()
 	syncConfigFromUI()
-	if triggerRecalc then triggerRecalc(true) end
+	scheduleRecalc()
 end)
 Toggles.AntiEngineTurbo:OnChanged(function()
 	syncConfigFromUI()
 	if not CONFIG.AntiEngineTurbo then
 		STATE.Opp.turboActive = false
 		STATE.Opp.turboReason = nil
+		STATE.Opp.suspect = false
+		cancelPrefetchState()
 	end
+	scheduleRecalc()
 end)
 Toggles.AutoPlay:OnChanged(function(val)
 	syncConfigFromUI()
 	if val then
 		STATE.LastAutoKey = ""
 		STATE.AutoRetryAfter = 0
-		if STATE.CurrentResult and STATE.App and STATE.App.session then
-			performSafeAutoMove(STATE.App.session, STATE.CurrentResult, STATE.LastKey)
-		elseif triggerRecalc then
-			triggerRecalc(true)
+		if STATE.App and STATE.App.session then
+			if STATE.CurrentResult then
+				performSafeAutoMove(STATE.App.session, STATE.CurrentResult, STATE.LastKey)
+			else
+				scheduleRecalc()
+			end
 		end
+	else
+		STATE.AutoGen += 1
+		STATE.AutoPending = false
+		STATE.AutoExpectedWait = 0
 	end
 end)
 Options.AutoDelayMin:OnChanged(syncConfigFromUI)
@@ -3026,6 +3570,7 @@ Toggles.AutoFindMatch:OnChanged(function(val)
 	end
 end)
 Options.AutoFindTc:OnChanged(syncConfigFromUI)
+Toggles.AutoReloadOnTeleport:OnChanged(syncConfigFromUI)
 
 -- ThemeManager & SaveManager
 if ThemeManager and SaveManager then
@@ -3033,7 +3578,10 @@ if ThemeManager and SaveManager then
 		ThemeManager:SetLibrary(Library)
 		SaveManager:SetLibrary(Library)
 		SaveManager:IgnoreThemeSettings()
-		SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
+		SaveManager:SetIgnoreIndexes({ "MenuKeybind", "VpsApiUrl" })
+		if type(SaveManager.SetLoadingOrder) == "function" then
+			SaveManager:SetLoadingOrder(true, { "Input", "Dropdown", "Slider", "ColorPicker", "KeyPicker", "Toggle" })
+		end
 		ThemeManager:SetFolder("BeverlyHub")
 		SaveManager:SetFolder("BeverlyHub/RoChess")
 		SaveManager:BuildConfigSection(Tabs.Settings)
@@ -3045,27 +3593,112 @@ end
 syncConfigFromUI()
 
 -- ============================================================================
--- 6. SAFE AUTO-PLAY VIA REAL VIRTUAL INPUT CLICKS (PASSES u152 & fromInput())
+-- 6. SAFE AUTO-PLAY VIA REAL VIRTUAL INPUT CLICKS (PASSES u152, fromInput() & bl=0)
 -- ============================================================================
-local function sendSafeClick(viewportX, viewportY)
+-- Track Roblox window focus so AutoPlay NEVER clicks while alt-tabbed (Layer-5 bl focus safety)
+trackConn(UserInputService.WindowFocusReleased:Connect(function()
+	STATE.WindowFocused = false
+end))
+trackConn(UserInputService.WindowFocused:Connect(function()
+	STATE.WindowFocused = true
+end))
+
+local function getSessionPly(sess)
+	return (sess and type(sess.ucis) == "table") and #sess.ucis or 0
+end
+
+local function isSafeToSendInput()
+	if not STATE.WindowFocused then
+		return false, "Focus"
+	end
+	if UserInputService:GetFocusedTextBox() ~= nil then
+		return false, "Typing"
+	end
+	if UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) then
+		return false, "Mouse Held"
+	end
+	return true, nil
+end
+
+local function isPointOverMenu(vpPoint, inset)
+	local mf = Window and Window.MainFrame
+	if not mf or not mf.Visible or not Library or not Library.Toggled then
+		return false
+	end
+	local mPos = mf.AbsolutePosition + inset
+	local mSz = mf.AbsoluteSize
+	return vpPoint.X >= (mPos.X - 6) and vpPoint.X <= (mPos.X + mSz.X + 6)
+		and vpPoint.Y >= (mPos.Y - 6) and vpPoint.Y <= (mPos.Y + mSz.Y + 6)
+end
+
+local function ensureBoardUnoccluded(pFrom, pTo, inset)
+	if not (isPointOverMenu(pFrom, inset) or isPointOverMenu(pTo, inset)) then
+		return false
+	end
+	local mf = Window and Window.MainFrame
+	if Library and type(Library.Toggle) == "function" then
+		-- Hide instantly (bypass 0.3s fade animation during AutoPlay so VIM clicks never hit MainFrame)
+		local prevAnim = Library.Animations and Library.Animations.ToggleWindow
+		if Library.Animations then
+			Library.Animations.ToggleWindow = false
+		end
+		pcall(function()
+			Library:Toggle(false)
+		end)
+		if Library.Animations then
+			Library.Animations.ToggleWindow = prevAnim
+		end
+	end
+	-- Wait 1 frame (and up to 0.36s if a prior fade tween was already running)
+	pcall(function()
+		RunService.RenderStepped:Wait()
+	end)
+	if mf then
+		local waitHideUntil = os.clock() + 0.36
+		while mf.Visible and STATE.Alive and os.clock() < waitHideUntil do
+			task.wait(0.02)
+		end
+	end
+	if not STATE.MenuAutoHiddenNotified then
+		STATE.MenuAutoHiddenNotified = true
+		pcall(function()
+			Library:Notify({
+				Title = "Menu Auto-Hidden",
+				Description = "BeverlyHub hid to avoid blocking Auto Play clicks. Press RightShift to reopen.",
+				Time = 3.5,
+			})
+		end)
+	end
+	return true
+end
+
+local function sendSafeClick(viewportX, viewportY, fast)
 	local ok, vim = pcall(function()
 		return game:GetService("VirtualInputManager")
 	end)
 	if not ok or not vim then
 		return false
 	end
-	pcall(function()
+	local waitMin = fast and 0.012 or 0.030
+	local waitSpan = fast and 0.010 or 0.040
+	local okMove = pcall(function()
 		vim:SendMouseMoveEvent(viewportX, viewportY, game)
 	end)
-	task.wait(0.03 + math.random() * 0.04)
-	pcall(function()
+	if not okMove then
+		return false
+	end
+	task.wait(waitMin + math.random() * waitSpan)
+	local okDown = pcall(function()
 		vim:SendMouseButtonEvent(viewportX, viewportY, 0, true, game, 1)
 	end)
-	task.wait(0.03 + math.random() * 0.04)
-	pcall(function()
+	if not okDown then
+		return false
+	end
+	task.wait(waitMin + math.random() * waitSpan)
+	local okUp = pcall(function()
 		vim:SendMouseButtonEvent(viewportX, viewportY, 0, false, game, 1)
 	end)
-	return true
+	return okUp == true
 end
 
 local function randTriangular(lo, hi)
@@ -3076,50 +3709,48 @@ local function randTriangular(lo, hi)
 	return lo + u * (hi - lo)
 end
 
-local function getLiveClockMs(session, color)
-	if not session or not session.clocks or not color then
-		return nil
-	end
-	if type(session.clockFor) == "function" then
-		local ok, ms = pcall(session.clockFor, session, color, workspace:GetServerTimeNow())
-		if ok and type(ms) == "number" then
-			return ms
-		end
-	end
-	return session.clocks[color]
-end
-
 local function computeSmartAutoDelay(session, res)
 	local kind = session.kind
 	local turbo = CONFIG.AntiEngineTurbo and STATE.Opp.turboActive and kind == "online"
+	local suspect = CONFIG.AntiEngineTurbo and STATE.Opp.suspect and kind == "online"
 	local lo = math.min(CONFIG.AutoDelayMin or 1.0, CONFIG.AutoDelayMax or 5.0)
 	local hi = math.max(CONFIG.AutoDelayMin or 1.0, CONFIG.AutoDelayMax or 5.0)
 	local msLeft = (kind == "online" and session.myColor) and getLiveClockMs(session, session.myColor) or nil
 	local oppMsLeft = (kind == "online" and session.myColor) and getLiveClockMs(session, -session.myColor) or nil
+	local baseMs = (kind == "online") and STATE.Opp.baseMs or nil
+	local isBullet = (baseMs ~= nil and baseMs <= 120000)
 
 	if turbo then
-		local fastHi = (msLeft and msLeft < 10000) and 0.24 or 0.34
-		return randTriangular(0.10, fastHi), "Turbo"
+		local fastHi = (msLeft and msLeft < 12000) and 0.22 or 0.32
+		return randTriangular(0.08, fastHi), (msLeft and msLeft < 12000) and "Turbo Scramble" or "Turbo"
 	end
 	if msLeft and msLeft < 12000 then
-		return randTriangular(0.09, 0.24), "Scramble"
+		return randTriangular(0.08, 0.22), "Scramble"
 	end
 	if kind == "puzzle" or kind == "rush" then
-		return randTriangular(math.min(lo, 0.25), math.min(hi, 0.90)), "Puzzle"
+		-- Respect user AutoDelayMin/Max in Puzzle/Rush (no artificial 0.25-0.90s speed clamp)
+		return randTriangular(lo, hi), "Puzzle"
 	end
 
-	local target = randTriangular(lo, hi)
+	-- Scale middlegame AutoDelayMin/Max smoothly by time control (1+0 -> 0.33x, 2+1 -> 0.67x, 3+0+ -> 1.0x)
+	local tcScale = baseMs and math.clamp(baseMs / 180000, 0.30, 1.0) or 1.0
+	local effLo = (kind == "online") and math.max(0.18, lo * tcScale) or lo
+	local effHi = (kind == "online") and math.max(effLo + 0.08, hi * tcScale) or hi
+
+	local target = randTriangular(effLo, effHi)
 	local phaseTag = "Normal"
 	local isForcedMate = (res.mate ~= nil and math.abs(res.mate) <= 2)
+	local onlyOneLegal = false
+	local isRecapture = false
+	local isOpening = false
 
 	if CONFIG.SmartDelay and session.engine then
-		local ply = (session.ucis and #session.ucis) or 0
+		local ply = getSessionPly(session)
 		local fullMove = math.floor(ply / 2) + 1
 		local fen = session.engine:getFen()
 		local totalPieces = countFenPieces(fen)
 
 		-- Detect forced single legal move (quick check)
-		local onlyOneLegal = false
 		pcall(function()
 			local b = PureChess.new(fen)
 			local legal = b:legalMoves()
@@ -3129,46 +3760,47 @@ local function computeSmartAutoDelay(session, res)
 		end)
 
 		-- Detect immediate recapture on opponent's last destination square
-		local lastOppUci = (ply >= 1 and session.ucis) and session.ucis[ply] or nil
-		local isRecapture = (type(lastOppUci) == "string" and #lastOppUci >= 4 and type(res.best) == "string" and #res.best >= 4)
+		local lastOppUci = (ply >= 1 and type(session.ucis) == "table") and session.ucis[ply] or nil
+		isRecapture = (type(lastOppUci) == "string" and #lastOppUci >= 4 and type(res.best) == "string" and #res.best >= 4)
 			and (string.sub(lastOppUci, 3, 4) == string.sub(res.best, 3, 4))
+		isOpening = (CONFIG.FastOpeningMoves > 0 and fullMove <= CONFIG.FastOpeningMoves)
 
 		if isForcedMate or onlyOneLegal then
 			-- Instant forced mate or only legal move
-			target = randTriangular(math.min(lo, 0.18), math.min(hi, 0.55))
+			target = randTriangular(math.min(effLo, 0.18), math.min(effHi, 0.55))
 			phaseTag = onlyOneLegal and "Forced" or "Mate Snap"
-		elseif CONFIG.FastOpeningMoves > 0 and fullMove <= CONFIG.FastOpeningMoves then
+		elseif isOpening then
 			-- Opening book / theory phase: fast & natural slight ramp from move 1 to N
 			local progress = (fullMove - 1) / math.max(1, CONFIG.FastOpeningMoves)
-			local openLo = math.min(lo, 0.22 + progress * 0.12)
-			local openHi = math.min(hi, 0.62 + progress * 0.32)
+			local openLo = math.min(effLo, (0.22 + progress * 0.12) * math.max(0.65, tcScale))
+			local openHi = math.min(effHi, (0.62 + progress * 0.32) * math.max(0.65, tcScale))
 			target = randTriangular(openLo, math.max(openLo + 0.05, openHi))
 			phaseTag = "Opening #" .. tostring(fullMove)
 		elseif totalPieces <= (CONFIG.EndgamePieces or 10) then
 			-- Simplified endgame speedup
 			if totalPieces <= 6 then
-				target = randTriangular(math.min(lo, 0.16), math.min(hi, 0.48))
+				target = randTriangular(math.min(effLo, 0.16), math.min(effHi, 0.48))
 			else
-				target = randTriangular(math.min(lo, 0.22), math.min(hi, 0.78))
+				target = randTriangular(math.min(effLo, 0.22), math.min(effHi, 0.78))
 			end
 			phaseTag = "Endgame · " .. tostring(totalPieces) .. " pcs"
 		elseif isRecapture then
 			-- Natural quick recapture in middlegame
-			target = math.max(0.32, randTriangular(lo, hi) * 0.48)
+			target = math.max(0.28, randTriangular(effLo, effHi) * 0.48)
 			phaseTag = "Recapture"
 		else
 			-- Complexity-aware Middlegame: correlate think time with tactical sharpness (pvGapCp & evalSwing)
-			local mid = 0.65 * randTriangular(lo, hi) + 0.35 * (lo + math.random() * math.max(0.04, hi - lo))
+			local mid = 0.65 * randTriangular(effLo, effHi) + 0.35 * (effLo + math.random() * math.max(0.04, effHi - effLo))
 			local pvGap = res.pvGapCp
 			local evalSwing = res.evalSwing or 0
-			local isQuietSharp = (not res.isCapture) and ((pvGap ~= nil and pvGap >= 55 and pvGap <= 280) or evalSwing >= 140)
+			local isQuietSharp = (not suspect) and (not res.isCapture) and ((pvGap ~= nil and pvGap >= 55 and pvGap <= 280) or evalSwing >= 140)
 			local isCalm = (pvGap ~= nil and pvGap <= 18 and evalSwing < 55)
 
 			if isQuietSharp then
-				target = math.min(hi + 2.6, mid * randTriangular(1.25, 1.65))
+				target = math.min(effHi + 2.6 * tcScale, mid * randTriangular(1.25, 1.65))
 				phaseTag = "Deep Think"
 			elseif isCalm then
-				target = math.max(lo * 0.72, mid * randTriangular(0.68, 0.92))
+				target = math.max(effLo * 0.72, mid * randTriangular(0.68, 0.92))
 				phaseTag = "Calm Mid"
 			else
 				target = mid
@@ -3177,42 +3809,62 @@ local function computeSmartAutoDelay(session, res)
 		end
 	end
 
-	-- Base online clock safety cap (never stall on low clock or bullet games)
-	if msLeft then
-		local secLeft = msLeft / 1000
-		if secLeft < 15 then
-			target = math.min(target, 0.28)
-		elseif secLeft < 30 then
-			target = math.min(target, 0.85)
-		elseif secLeft < 60 then
-			target = math.min(target, math.max(0.45, secLeft * 0.055))
-		elseif secLeft < 120 then
-			target = math.min(target, math.max(0.75, secLeft * 0.045))
+	-- Early Suspect tier: disable Deep Think (above) and cap total delay <= 0.90s!
+	if suspect then
+		if target > 0.90 then
+			target = randTriangular(0.35, 0.90)
+			phaseTag = "Suspect Pace"
 		end
 	end
 
+	-- Monotonic online clock safety cap (zero 60s inversion jump)
+	local safetyCap = 12.0
+	if msLeft then
+		local secLeft = msLeft / 1000
+		if secLeft < 12 then
+			safetyCap = 0.24
+		elseif secLeft < 15 then
+			safetyCap = 0.32
+		elseif secLeft < 30 then
+			safetyCap = math.clamp(secLeft * 0.028, 0.32, 0.85)
+		elseif secLeft < 120 then
+			safetyCap = math.max(0.85, secLeft * 0.04)
+		end
+		target = math.min(target, safetyCap)
+	end
+
 	-- Max Clock Lead Cap (anti-sus pacing: keeps remaining clock at most ~N sec ahead of opponent)
+	-- Excluded on Bullet, openings, forced moves, recaptures, forced mates, Suspect, Engine, and Turbo!
 	local leadCap = CONFIG.MaxClockLead or 30
-	if leadCap > 0 and msLeft and oppMsLeft and not STATE.Opp.engineDetected and not isForcedMate then
+	if leadCap > 0
+		and msLeft
+		and oppMsLeft
+		and not isBullet
+		and not onlyOneLegal
+		and not isRecapture
+		and not isOpening
+		and not isForcedMate
+		and not suspect
+		and not STATE.Opp.engineDetected
+	then
 		local mySec = msLeft / 1000
 		local oppSec = oppMsLeft / 1000
 		local leadSec = mySec - oppSec
 
-		-- Safety guard: only bleed lead while we still have a healthy clock (>= 42s) and never bleed below 35s
-		if mySec >= 42 then
+		if leadSec > 0 and mySec >= 42 then
 			local safeBleedBudget = math.max(0, mySec - 35)
+			local maxThink = math.min(12.0, safeBleedBudget, safetyCap * 2.5)
+			local cushionStart = math.max(1, leadCap - 7)
 			if leadSec > leadCap then
-				-- Smoothly bleed excess lead back down to <= leadCap (max ~12s per single move so it looks natural)
 				local excess = leadSec - leadCap
 				local bleed = excess * randTriangular(0.55, 0.90) + randTriangular(0.4, 1.8)
-				local maxThink = math.min(12.0, safeBleedBudget)
 				target = math.min(maxThink, math.max(target + bleed * 0.55, bleed))
 				phaseTag = string.format("Lead Cap (+%ds)", math.floor(leadSec + 0.5))
-			elseif leadSec >= (leadCap - 7) and mySec >= 55 then
-				-- Soft cushion near the cap so our clock cruises smoothly around +23..30s instead of overshooting
-				local closeness = math.clamp((leadSec - (leadCap - 7)) / 7, 0, 1)
+			elseif leadSec >= cushionStart and mySec >= 55 then
+				local span = math.max(1, leadCap - cushionStart)
+				local closeness = math.clamp((leadSec - cushionStart) / span, 0, 1)
 				local cushion = closeness * randTriangular(0.5, 1.9)
-				target = math.min(safeBleedBudget, target + cushion)
+				target = math.min(maxThink, target + cushion)
 			end
 		end
 	end
@@ -3249,24 +3901,40 @@ performSafeAutoMove = function(session, res, expectedKey)
 		return
 	end
 
+	STATE.AutoGen += 1
+	local myAutoGen = STATE.AutoGen
 	STATE.AutoPending = true
 	STATE.AutoPendingAt = os.clock()
 	STATE.LastAutoKey = expectedKey
 
 	task.spawn(function()
+		local function isStaleAuto()
+			return (not STATE.Alive) or (not CONFIG.AutoPlay) or (STATE.AutoGen ~= myAutoGen) or (STATE.LastKey ~= expectedKey)
+		end
+
 		local turbo = CONFIG.AntiEngineTurbo and STATE.Opp.turboActive and kind == "online"
+		local liveMsInit = (kind == "online" and session.myColor) and getLiveClockMs(session, session.myColor) or nil
+		local isFastInit = turbo or (liveMsInit ~= nil and liveMsInit < 12000)
 		local targetTotal, phaseTag = computeSmartAutoDelay(session, res)
 		local spent = (res.ms or 0) / 1000
-		local minAfterArrow = turbo and 0.06 or 0.16
-		local waitSec = math.max(minAfterArrow, targetTotal - spent)
+		local clickOverhead = isFastInit and 0.095 or 0.24
+		local minAfterArrow = isFastInit and 0.03 or 0.10
+		local waitSec = math.max(minAfterArrow, targetTotal - spent - clickOverhead)
 
-		-- On move 1 (ply 0), ensure game-start board transition/flip has settled before clicking!
-		local plyNow = (session.ucis and #session.ucis) or 0
-		if plyNow == 0 and STATE.SessionStartedAt > 0 then
-			local sinceStart = os.clock() - STATE.SessionStartedAt
-			local settleNeed = 0.40 - sinceStart
+		-- On move 1 (ply <= 1: both White & Black) or immediately after Watchdog #0 page switch,
+		-- ensure game-start board transition/flip has settled before clicking!
+		local plyNow = getSessionPly(session)
+		local nowT = os.clock()
+		if plyNow <= 1 and STATE.SessionStartedAt > 0 then
+			local anchor = math.max(STATE.SessionStartedAt, STATE.LastPageSwitchAt or 0)
+			local settleNeed = 0.40 - (nowT - anchor)
 			if settleNeed > waitSec then
 				waitSec = settleNeed
+			end
+		elseif (STATE.LastPageSwitchAt or 0) > 0 then
+			local pageSettle = 0.40 - (nowT - STATE.LastPageSwitchAt)
+			if pageSettle > waitSec then
+				waitSec = pageSettle
 			end
 		end
 
@@ -3277,30 +3945,60 @@ performSafeAutoMove = function(session, res, expectedKey)
 
 		local endAt = os.clock() + waitSec
 		while os.clock() < endAt do
-			if not STATE.Alive or not CONFIG.AutoPlay or STATE.LastKey ~= expectedKey then
-				STATE.AutoPending = false
+			if isStaleAuto() then
+				if STATE.AutoGen == myAutoGen then
+					STATE.AutoPending = false
+				end
 				return
 			end
 			-- If Turbo activates mid-wait, cut remaining wait immediately!
-			if CONFIG.AntiEngineTurbo and STATE.Opp.turboActive and kind == "online" and (endAt - os.clock()) > 0.25 then
-				endAt = os.clock() + 0.12
+			if CONFIG.AntiEngineTurbo and STATE.Opp.turboActive and kind == "online" and (endAt - os.clock()) > 0.14 then
+				endAt = os.clock() + 0.06
 			end
-			task.wait(0.04)
+			task.wait(0.03)
 		end
 
+		-- Refresh turbo & fastClick state AFTER wait loop so mid-wait Turbo gets fast clicks immediately!
+		turbo = CONFIG.AntiEngineTurbo and STATE.Opp.turboActive and kind == "online"
+		local liveMsAfter = (kind == "online" and session.myColor) and getLiveClockMs(session, session.myColor) or nil
+		local fastClick = turbo or (liveMsAfter ~= nil and liveMsAfter < 12000)
+
 		-- Verified click loop (up to 3 attempts; clears LastAutoKey with backoff if clicks did not register!)
-		local targetPly = #session.ucis
+		local targetPly = getSessionPly(session)
 		local moveRegistered = false
-		for attempt = 1, 3 do
+		local attempt = 0
+		while attempt < 3 do
 			local curApp = STATE.App
-			if not STATE.Alive or not CONFIG.AutoPlay or not curApp or curApp.session ~= session or session.over or not session:isMyTurn() then
+			if isStaleAuto() or not curApp or curApp.session ~= session or session.over or not session:isMyTurn() then
 				moveRegistered = true
 				break
 			end
-			if #session.ucis ~= targetPly then
+			if getSessionPly(session) ~= targetPly then
 				moveRegistered = true
 				break
 			end
+
+			-- Pause cleanly if unfocused / typing / holding mouse button (protects Layer-5 bl=0!)
+			local safeIn, pauseWhy = isSafeToSendInput()
+			if not safeIn then
+				STATE.AutoPendingAt = os.clock()
+				if Window and type(Window.SetScriptStatus) == "function" then
+					pcall(Window.SetScriptStatus, Window, "Auto · Paused", pauseWhy or "Waiting")
+				end
+				task.wait(0.08)
+				continue
+			end
+
+			-- Re-check fullPage() inside retry loop before clicking!
+			if type(curApp.fullPage) == "function" then
+				local okFull, isFull = pcall(curApp.fullPage)
+				if okFull and isFull then
+					STATE.AutoPendingAt = os.clock()
+					task.wait(0.14)
+					continue
+				end
+			end
+
 			local curBoard = curApp.board
 			local f = curBoard and curBoard.frame
 			if not f or not f.Visible or not curBoard.interactive or f.AbsoluteSize.X < 80 then
@@ -3308,9 +4006,10 @@ performSafeAutoMove = function(session, res, expectedKey)
 				continue
 			end
 
+			attempt += 1
 			if attempt > 1 and type(curBoard.deselect) == "function" then
 				pcall(function() curBoard:deselect() end)
-				task.wait(0.05)
+				task.wait(0.04)
 			end
 
 			local inset = GuiService:GetGuiInset()
@@ -3319,57 +4018,148 @@ performSafeAutoMove = function(session, res, expectedKey)
 			local pFrom = f.AbsolutePosition + inset + sqCenterLocal(res.fromSq, curBoard.flipped, sqPx)
 			local pTo = f.AbsolutePosition + inset + sqCenterLocal(res.toSq, curBoard.flipped, sqPx)
 
-			sendSafeClick(pFrom.X + (math.random() * 2 - 1) * jitter, pFrom.Y + (math.random() * 2 - 1) * jitter)
-			-- Occasional brief human piece-hold pause in non-Turbo middlegame before dropping piece
-			local clickPause = (turbo and 0.045 or 0.075) + math.random() * (turbo and 0.035 or 0.065)
-			if not turbo and plyNow >= 8 and attempt == 1 and math.random() < 0.22 then
-				local msCheck = (kind == "online" and session.myColor) and getLiveClockMs(session, session.myColor) or 60000
+			-- Never click BeverlyHub's own MainFrame: auto-hide cleanly and re-sample coordinates
+			if ensureBoardUnoccluded(pFrom, pTo, inset) then
+				if isStaleAuto() or curApp.session ~= session or getSessionPly(session) ~= targetPly then
+					moveRegistered = true
+					break
+				end
+				inset = GuiService:GetGuiInset()
+				sqPx = f.AbsoluteSize.X / 8
+				jitter = sqPx * 0.11
+				pFrom = f.AbsolutePosition + inset + sqCenterLocal(res.fromSq, curBoard.flipped, sqPx)
+			end
+
+			local okFrom = sendSafeClick(
+				pFrom.X + (math.random() * 2 - 1) * jitter,
+				pFrom.Y + (math.random() * 2 - 1) * jitter,
+				fastClick
+			)
+			if not okFrom then
+				task.wait(0.08)
+				continue
+			end
+
+			-- Refresh fastClick again & brief human piece-hold pause in non-Turbo middlegame
+			turbo = CONFIG.AntiEngineTurbo and STATE.Opp.turboActive and kind == "online"
+			local msCheck = (kind == "online" and session.myColor) and getLiveClockMs(session, session.myColor) or 60000
+			fastClick = turbo or (msCheck ~= nil and msCheck < 12000)
+
+			local clickPause = fastClick
+				and (0.022 + math.random() * 0.020)
+				or (0.075 + math.random() * 0.065)
+			if not fastClick and not STATE.Opp.suspect and plyNow >= 8 and attempt == 1 and math.random() < 0.22 then
 				if msCheck and msCheck > 30000 then
 					clickPause += 0.16 + math.random() * 0.34
 				end
 			end
 			task.wait(clickPause)
 
-			if not STATE.Alive or curApp.session ~= session or #session.ucis ~= targetPly then
+			if isStaleAuto() or curApp.session ~= session or session.over or getSessionPly(session) ~= targetPly or not session:isMyTurn() then
 				moveRegistered = true
 				break
 			end
-			sendSafeClick(pTo.X + (math.random() * 2 - 1) * jitter, pTo.Y + (math.random() * 2 - 1) * jitter)
-
-			-- Handle manual promotion popup if it opens
-			if res.promo and res.promo ~= 0 and curBoard.overlayLayer then
-				task.wait(0.10)
-				local col = curBoard.overlayLayer:FindFirstChild("PromoColumn")
-				if col then
-					local btn = col:FindFirstChild("Choice" .. tostring(res.promo))
-					if btn and btn:IsA("GuiObject") then
-						local pc = btn.AbsolutePosition + inset + btn.AbsoluteSize * 0.5
-						sendSafeClick(pc.X, pc.Y)
+			if not isSafeToSendInput() then
+				if type(curBoard.deselect) == "function" then
+					pcall(function() curBoard:deselect() end)
+				end
+				attempt = math.max(0, attempt - 1)
+				continue
+			end
+			if type(curApp.fullPage) == "function" then
+				local okFull2, isFull2 = pcall(curApp.fullPage)
+				if okFull2 and isFull2 then
+					if type(curBoard.deselect) == "function" then
+						pcall(function() curBoard:deselect() end)
 					end
+					continue
+				end
+			end
+
+			-- Recompute fresh pTo + inset after clickPause (guards against resize/reposition)
+			local f2 = curApp.board and curApp.board.frame
+			if not f2 or not f2.Visible or f2.AbsoluteSize.X < 80 then
+				continue
+			end
+			local inset2 = GuiService:GetGuiInset()
+			local sqPx2 = f2.AbsoluteSize.X / 8
+			local jitter2 = sqPx2 * 0.11
+			pTo = f2.AbsolutePosition + inset2 + sqCenterLocal(res.toSq, curApp.board.flipped, sqPx2)
+			ensureBoardUnoccluded(pTo, pTo, inset2)
+
+			local okTo = sendSafeClick(
+				pTo.X + (math.random() * 2 - 1) * jitter2,
+				pTo.Y + (math.random() * 2 - 1) * jitter2,
+				fastClick
+			)
+			if not okTo then
+				task.wait(0.08)
+				continue
+			end
+			STATE.LastAutoClickAt = os.clock()
+
+			-- Handle manual promotion popup if it opens (poll up to 0.40s with bounded jitter)
+			if res.promo and res.promo ~= 0 and curBoard.overlayLayer then
+				local promoDeadline = os.clock() + 0.40
+				local promoBtn = nil
+				while os.clock() < promoDeadline and STATE.Alive and STATE.AutoGen == myAutoGen do
+					if curApp.session ~= session or session.over or getSessionPly(session) ~= targetPly then
+						break
+					end
+					local col = curBoard.overlayLayer:FindFirstChild("PromoColumn")
+					if col then
+						local found = col:FindFirstChild("Choice" .. tostring(res.promo))
+						if found and found:IsA("GuiObject") and found.Visible and found.AbsoluteSize.X > 4 then
+							promoBtn = found
+							break
+						end
+					end
+					task.wait(0.025)
+				end
+				if promoBtn and promoBtn.Parent and isSafeToSendInput() then
+					local pInset = GuiService:GetGuiInset()
+					local pj = math.min(promoBtn.AbsoluteSize.X, promoBtn.AbsoluteSize.Y) * 0.12
+					local pc = promoBtn.AbsolutePosition + pInset + promoBtn.AbsoluteSize * 0.5
+					ensureBoardUnoccluded(pc, pc, pInset)
+					sendSafeClick(
+						pc.X + (math.random() * 2 - 1) * pj,
+						pc.Y + (math.random() * 2 - 1) * pj,
+						fastClick
+					)
 				end
 			end
 
 			-- Verify move registered before finishing
-			local verifyUntil = os.clock() + (turbo and 0.24 or 0.38)
+			local verifyUntil = os.clock() + (fastClick and 0.22 or 0.36)
 			while os.clock() < verifyUntil do
-				if not STATE.Alive or curApp.session ~= session or session.over or #session.ucis ~= targetPly or not session:isMyTurn() then
+				if not STATE.Alive or STATE.AutoGen ~= myAutoGen or curApp.session ~= session or session.over or getSessionPly(session) ~= targetPly or not session:isMyTurn() then
 					moveRegistered = true
 					break
 				end
-				task.wait(0.04)
+				task.wait(0.03)
 			end
-			if moveRegistered or #session.ucis ~= targetPly or not session:isMyTurn() or session.over then
+			if moveRegistered or getSessionPly(session) ~= targetPly or not session:isMyTurn() or session.over then
 				moveRegistered = true
 				break
 			end
 		end
 
 		-- CRITICAL START-OF-GAME RECOVERY: If board/intro ate all 3 clicks, unlock LastAutoKey so watchdog retries!
-		if not moveRegistered and STATE.Alive and STATE.App and STATE.App.session == session and not session.over and session:isMyTurn() and #session.ucis == targetPly then
+		if not moveRegistered
+			and STATE.Alive
+			and STATE.AutoGen == myAutoGen
+			and STATE.App
+			and STATE.App.session == session
+			and not session.over
+			and session:isMyTurn()
+			and getSessionPly(session) == targetPly
+		then
 			STATE.LastAutoKey = ""
 			STATE.AutoRetryAfter = os.clock() + 0.55
 		end
-		STATE.AutoPending = false
+		if STATE.AutoGen == myAutoGen then
+			STATE.AutoPending = false
+		end
 	end)
 end
 
@@ -3492,8 +4282,8 @@ local function renderOverlay()
 		tostring(res.mate), tostring(accentColor),
 	}, "|")
 	if STATE.LastArrowSig ~= arrowSig then
-		STATE.LastArrowSig = arrowSig
 		clearArrows()
+		STATE.LastArrowSig = arrowSig
 		if CONFIG.ShowArrows then
 			if CONFIG.ShowPonder and res.ponderFrom and res.ponderTo then
 				drawBoardArrow(res.ponderFrom, res.ponderTo, flipped, sqPx, THEME.Amber, 0.56, 2)
@@ -3550,6 +4340,8 @@ local function resetOpponentTracker(gameId)
 	o.gameId = gameId
 	o.lastPly = -1
 	o.oppTurnStartAt = os.clock()
+	o.baseMs = nil
+	o.incMs = 0
 	o.expectedByPly = {}
 	o.checked = 0
 	o.hits = 0
@@ -3557,16 +4349,21 @@ local function resetOpponentTracker(gameId)
 	o.maxStreak = 0
 	o.fastHits = 0
 	o.blunders = 0
+	o.blunderPenalty = 0
 	o.lastEvalForMe = nil
+	o.lastEvalSource = nil
 	o.times = {}
 	o.suspicion = 0
+	o.suspect = false
 	o.engineDetected = false
+	o.clockPressure = false
 	o.turboActive = false
 	o.turboReason = nil
 	o.notified = false
+	o.adaptTier = nil
+	o.lastAdaptPly = -1
 	STATE.LastMyTurnResult = nil
-	STATE.PrefetchKey = ""
-	STATE.PrefetchInFlight = false
+	cancelPrefetchState()
 end
 
 local function recomputeOpponentSuspicion()
@@ -3577,51 +4374,65 @@ local function recomputeOpponentSuspicion()
 	if o.checked >= 5 then
 		score += math.clamp(math.floor((rate - 0.45) * 140), 0, 62)
 	elseif o.checked >= 3 then
-		-- Preview score only (cannot trigger engineDetected until checked >= 5)
-		score += math.clamp(math.floor((rate - 0.50) * 90), 0, 38)
+		-- Early Suspect-tier scoring (cannot trigger confirmed ENGINE until checked >= 5)
+		score += math.clamp(math.floor((rate - 0.42) * 115), 0, 48)
 	end
 
-	if o.streak >= 6 then
+	-- Credit best streak (maxStreak) so 4/5 fast hits doesn't fail on mid-sequence permutation
+	local effStreak = math.max(o.streak or 0, o.maxStreak or 0)
+	if effStreak >= 6 then
 		score += 36
-	elseif o.streak == 5 then
+	elseif effStreak == 5 then
 		score += 26
-	elseif o.streak == 4 then
-		score += 15
+	elseif effStreak == 4 then
+		score += 18
+	elseif effStreak == 3 then
+		score += 10
 	end
 
 	if o.fastHits >= 5 then
 		score += 20
 	elseif o.fastHits == 4 then
-		score += 12
+		score += 14
+	elseif o.fastHits == 3 then
+		score += 8
 	end
 
-	-- Robotic cadence only contributes if opponent ALSO has high non-trivial accuracy (>= 65%)
-	if #o.times >= 6 and o.checked >= 4 and rate >= 0.65 then
+	-- Robotic cadence & fast-mean signal (requires >= 4 non-trivial timings & >= 65% accuracy)
+	if #o.times >= 4 and o.checked >= 3 and rate >= 0.65 then
 		local sum = 0
 		for _, t in ipairs(o.times) do sum += t end
 		local mean = sum / #o.times
 		local var = 0
 		for _, t in ipairs(o.times) do var += (t - mean) * (t - mean) end
 		local std = math.sqrt(var / #o.times)
-		if std < 0.32 and mean < 3.4 then
+		if std < 0.38 and mean < 3.4 then
 			score += 16
+		elseif mean <= 1.25 and std < 0.65 then
+			score += 10
 		end
 	end
 
-	-- Clear human blunder penalty (engines do not hang >= 2.00 pawns in balanced/playable positions)
-	if (o.blunders or 0) > 0 then
-		score -= o.blunders * 35
+	-- Rolling, capped human blunder penalty (decays after consecutive Stockfish hits)
+	if (o.blunderPenalty or 0) > 0 then
+		score -= math.min(o.blunderPenalty, 56)
 	end
 
 	o.suspicion = math.clamp(score, 0, 100)
 
-	-- Hysteresis latch: requires >= 5 non-trivial post-opening moves and >= 72% to engage;
-	-- automatically disengages if suspicion falls below 45% (prevents permanent false positives!)
+	-- Confirmed ENGINE hysteresis latch: requires >= 5 non-trivial moves and >= 72%
 	if o.checked >= 5 and o.suspicion >= 72 then
 		o.engineDetected = true
 	elseif o.engineDetected and o.suspicion < 45 then
 		o.engineDetected = false
 		o.notified = false
+	end
+
+	-- Early SUSPECT tier: checked >= 3 with 3/3 fast hits OR suspicion >= 52 (hysteresis release < 35)
+	if o.engineDetected or (o.checked >= 3 and ((o.hits == o.checked and o.fastHits >= 3) or o.suspicion >= 52)) then
+		o.suspect = true
+	elseif o.suspect and o.suspicion < 35 then
+		o.suspect = false
 	end
 end
 
@@ -3633,7 +4444,9 @@ local function formatOpponentLabel(sess)
 	if o.engineDetected then
 		return string.format("Opponent: ENGINE (%d%% · %d/%d) · TURBO", o.suspicion, o.hits, o.checked)
 	elseif o.turboActive then
-		return string.format("Opponent: %d%% · TURBO (%s)", o.suspicion, o.turboReason or "Clock")
+		return string.format("Opponent: %s%d%% · TURBO (%s)", o.suspect and "SUSPECT " or "", o.suspicion, o.turboReason or "Clock")
+	elseif o.suspect then
+		return string.format("Opponent: SUSPECT (%d%% · %d/%d match)", o.suspicion, o.hits, o.checked)
 	elseif o.checked > 0 then
 		return string.format("Opponent: Human (%d%% · %d/%d match)", o.suspicion, o.hits, o.checked)
 	end
@@ -3654,7 +4467,16 @@ local function updateOpponentDetector(sess)
 		resetOpponentTracker(gid)
 	end
 
-	local ply = sess.ucis and #sess.ucis or 0
+	-- Capture TC baseMs at ply <= 1 (or infer from sess.tc)
+	if o.baseMs == nil then
+		local bMs, iMs = resolveSessionTimeControl(sess)
+		if bMs then
+			o.baseMs = bMs
+			o.incMs = iMs or 0
+		end
+	end
+
+	local ply = getSessionPly(sess)
 	local now = os.clock()
 
 	if ply ~= o.lastPly then
@@ -3665,82 +4487,140 @@ local function updateOpponentDetector(sess)
 			if not sess:isMyTurn() then
 				-- We just played our move; start opponent timer & prefetch their expected Stockfish ponder reply!
 				o.oppTurnStartAt = now
-				local myUci = sess.ucis[ply]
+				local myUci = (type(sess.ucis) == "table") and sess.ucis[ply] or nil
 				local lastRes = STATE.LastMyTurnResult
-				if lastRes and lastRes.best == myUci and type(lastRes.ponder) == "string" and #lastRes.ponder >= 4 then
+				if lastRes
+					and isStockfishSource(lastRes.source)
+					and lastRes.best == myUci
+					and type(lastRes.ponder) == "string"
+					and #lastRes.ponder >= 4
+				then
 					local oppFen = sess.engine:getFen()
 					o.expectedByPly[ply + 1] = {
 						uci = lastRes.ponder,
+						myUci = myUci,
 						myCapture = lastRes.isCapture == true,
 						myToSq = string.sub(myUci, 3, 4),
 						oppFen = oppFen,
+						source = lastRes.source,
 					}
-					launchPonderPrefetch(oppFen, lastRes.ponder)
+					launchPonderPrefetch(oppFen, lastRes.ponder, sess)
+				else
+					-- Clear any stale pre-seeded entry if user played a different move or source was Luau/Book
+					o.expectedByPly[ply + 1] = nil
 				end
-			elseif prevPly >= 0 and ply == prevPly + 1 then
-				-- Opponent just moved! Filter out opening book (< ply 13), recaptures, and forced check evasions (<= 2 legal moves)
-				local dt = now - (o.oppTurnStartAt > 0 and o.oppTurnStartAt or now)
-				local oppUci = sess.ucis[ply]
-				local exp = o.expectedByPly[ply]
-				local isTrivial = false
-
-				if type(exp) == "table" then
-					local oppTo = (type(oppUci) == "string" and #oppUci >= 4) and string.sub(oppUci, 3, 4) or ""
-					-- 1. Immediate recapture on the square we just captured on
-					if exp.myCapture and oppTo == exp.myToSq then
-						isTrivial = true
-					end
-					-- 2. Forced move / check evasion with <= 2 legal moves
-					if not isTrivial and type(exp.oppFen) == "string" then
-						pcall(function()
-							local b = PureChess.new(exp.oppFen)
-							if #b:legalMoves() <= 2 then
-								isTrivial = true
-							end
-						end)
-					end
+			else
+				-- Opponent just moved (it is our turn again!)
+				-- Cancel non-matching speculative prefetch immediately so live solvePosition has zero lock contention
+				local curF4 = fen4Key(sess.engine:getFen())
+				if STATE.PrefetchFen4 ~= "" and STATE.PrefetchFen4 ~= curF4 then
+					cancelPrefetchState()
 				end
 
-				-- Only record cadence timing on non-trivial post-opening moves so instant recaptures don't look robotic
-				if ply >= 13 and not isTrivial and dt >= 0.04 and dt <= 120 then
-					table.insert(o.times, dt)
-					if #o.times > 20 then
-						table.remove(o.times, 1)
+				-- Score opponent move on both normal +1 ply transitions AND instant <0.13s premove +2 ply jumps!
+				if prevPly >= 0 and (ply == prevPly + 1 or ply == prevPly + 2) then
+					local jumpedTwo = (ply == prevPly + 2)
+					local oppUci = (type(sess.ucis) == "table") and sess.ucis[ply] or nil
+					local exp = o.expectedByPly[ply]
+					local validExp = (type(exp) == "table") and isStockfishSource(exp.source)
+					if validExp and jumpedTwo then
+						local myPlayed = (type(sess.ucis) == "table") and sess.ucis[ply - 1] or nil
+						if exp.myUci ~= nil and myPlayed ~= exp.myUci then
+							validExp = false
+						end
 					end
-				end
 
-				if ply >= 13 and type(exp) == "table" and exp.uci and not isTrivial then
-					o.checked += 1
-					if oppUci == exp.uci then
-						o.hits += 1
-						o.streak += 1
-						if o.streak > o.maxStreak then o.maxStreak = o.streak end
-						if dt <= 2.2 then
-							o.fastHits += 1
+					local dt
+					if jumpedTwo then
+						if STATE.LastAutoClickAt > 0 and (now - STATE.LastAutoClickAt) <= 1.5 then
+							dt = math.clamp(now - STATE.LastAutoClickAt, 0.05, 1.5)
+						else
+							dt = 0.08
 						end
 					else
-						o.streak = 0
+						dt = now - (o.oppTurnStartAt > 0 and o.oppTurnStartAt or now)
 					end
-				end
 
-				recomputeOpponentSuspicion()
+					local isTrivial = false
+					if validExp then
+						local oppTo = (type(oppUci) == "string" and #oppUci >= 4) and string.sub(oppUci, 3, 4) or ""
+						-- 1. Immediate recapture on the square we just captured on
+						if exp.myCapture and oppTo == exp.myToSq then
+							isTrivial = true
+						end
+						-- 2. Forced move / check evasion with <= 2 legal moves
+						if not isTrivial and type(exp.oppFen) == "string" then
+							pcall(function()
+								local b = PureChess.new(exp.oppFen)
+								if #b:legalMoves() <= 2 then
+									isTrivial = true
+								end
+							end)
+						end
+					end
+
+					-- Start detection at ply >= 9 (Move 5+) on non-trivial moves
+					if ply >= 9 and not isTrivial and dt >= 0.04 and dt <= 120 then
+						table.insert(o.times, dt)
+						if #o.times > 20 then
+							table.remove(o.times, 1)
+						end
+					end
+
+					if ply >= 9 and validExp and exp.uci and not isTrivial then
+						o.checked += 1
+						if oppUci == exp.uci then
+							o.hits += 1
+							o.streak += 1
+							if o.streak > o.maxStreak then o.maxStreak = o.streak end
+							if dt <= 2.2 then
+								o.fastHits += 1
+							end
+							-- Rolling decay of blunder penalty on verified top-move hits
+							if (o.blunderPenalty or 0) > 0 then
+								o.blunderPenalty = math.max(0, o.blunderPenalty - 10)
+							end
+						else
+							o.streak = 0
+						end
+					end
+
+					recomputeOpponentSuspicion()
+				end
 			end
 		end
 	end
 
-	-- Smarter clock-deficit check (won't false-trigger in bullet or when we're already way ahead on time!)
-	local clockPressure = false
-	if not sess.over and sess.clocks and sess.myColor and type(sess.clockFor) == "function" then
-		local srvNow = workspace:GetServerTimeNow()
-		local myMs = sess:clockFor(sess.myColor, srvNow)
-		local oppMs = sess:clockFor(-sess.myColor, srvNow)
-		if myMs < 14000
-			or (myMs < 26000 and oppMs > (myMs - 4000))
-			or ((oppMs - myMs) >= 18000 and myMs < 75000)
-		then
-			clockPressure = true
+	-- TC-relative clockPressure WITH release hysteresis (prevents +1/+2s increment sawtooth flickering)
+	local clockPressure = o.clockPressure == true
+	if sess.over then
+		clockPressure = false
+	elseif sess.clocks and sess.myColor then
+		local myMs = getLiveClockMs(sess, sess.myColor)
+		local oppMs = getLiveClockMs(sess, -sess.myColor)
+		if myMs and oppMs then
+			local baseMs = o.baseMs or 180000
+			local defTrigger = math.clamp(baseMs * 0.14, 8000, 20000)
+			local defRelease = defTrigger * 0.65
+			local deficit = oppMs - myMs
+
+			local shouldEngage = (myMs < 14000)
+				or (myMs < 26000 and oppMs > (myMs - 4000))
+				or (deficit >= defTrigger and myMs < (baseMs * 0.85))
+
+			if shouldEngage then
+				clockPressure = true
+			elseif clockPressure then
+				local canRelease = (myMs >= 18000)
+					and not (myMs < 30000 and oppMs > (myMs - 2000))
+					and (deficit < defRelease or myMs >= (baseMs * 0.90))
+				if canRelease then
+					clockPressure = false
+				end
+			end
 		end
 	end
+	o.clockPressure = clockPressure
 
 	local wantTurbo = CONFIG.AntiEngineTurbo and (o.engineDetected or clockPressure)
 	o.turboActive = wantTurbo
@@ -3794,9 +4674,12 @@ local function tickAutoFindMatch(app, sess, now)
 	end
 
 	if canQueue and (now - STATE.AutoFindLastQueueAt >= 5.0) and type(app.startSearch) == "function" then
+		local tc = (CONFIG.AutoFindTc == "Selected") and app.selectedTc or CONFIG.AutoFindTc
+		if tc == nil then
+			return
+		end
 		STATE.AutoFindLastQueueAt = now
 		STATE.AutoFindOverAt = 0
-		local tc = (CONFIG.AutoFindTc == "Selected") and app.selectedTc or CONFIG.AutoFindTc
 		if app.modals and type(app.modals.closeAll) == "function" then
 			pcall(app.modals.closeAll)
 		end
@@ -3826,7 +4709,14 @@ local function updateHudReadout(sess, res, thinking)
 	setUiLabel("MatchLabel", "Match: " .. kindCap .. " · " .. turnTxt)
 	setUiLabel("OpponentLabel", formatOpponentLabel(sess))
 
-	local turboTag = (CONFIG.AntiEngineTurbo and STATE.Opp.turboActive and sess.kind == "online") and " [TURBO]" or ""
+	local turboTag = ""
+	if CONFIG.AntiEngineTurbo and sess.kind == "online" then
+		if STATE.Opp.turboActive then
+			turboTag = " [TURBO]"
+		elseif STATE.Opp.suspect then
+			turboTag = " [SUSPECT]"
+		end
+	end
 
 	if thinking then
 		local activeName = STATE.ActiveEngine or CONFIG.EngineMode
@@ -3840,7 +4730,8 @@ local function updateHudReadout(sess, res, thinking)
 
 	if res then
 		local engName = res.engineLabel or res.source or "Engine"
-		local engKind = (turboTag ~= "" and "turbo") or (res.engineKind or "stockfish")
+		local engKind = (STATE.Opp.turboActive and CONFIG.AntiEngineTurbo and sess.kind == "online" and "turbo")
+			or (res.engineKind or "stockfish")
 		local depthTag = (res.depth and res.depth > 0 and res.depth < 99) and (" d" .. tostring(res.depth)) or ""
 		local msTag = (res.ms and res.ms >= 0) and (" · " .. tostring(res.ms) .. "ms") or ""
 
@@ -3854,13 +4745,16 @@ local function updateHudReadout(sess, res, thinking)
 		setPulseStatus(engName .. turboTag, (res.san or res.best) .. " (" .. evStr .. ")" .. depthTag)
 		updateEngineBadge(engName .. depthTag .. msTag .. turboTag, engKind)
 	else
-		local waitTxt = STATE.PrefetchInFlight and "Prefetching Ponder..." or ("Waiting (" .. CONFIG.EngineMode .. ")")
+		local isTerminal = (STATE.TerminalKey ~= "" and STATE.TerminalKey == STATE.LastKey)
+		local prefetching = (STATE.PrefetchDone ~= nil and not STATE.PrefetchDone.done)
+		local waitTxt = isTerminal and "Terminal Position"
+			or (prefetching and "Prefetching Ponder..." or ("Waiting (" .. CONFIG.EngineMode .. ")"))
 		setUiLabel("EngineLabel", "Active Engine: " .. waitTxt .. turboTag)
-		setUiLabel("BestMoveLabel", sess.over and "Best Move: Game Over" or "Best Move: Waiting...")
+		setUiLabel("BestMoveLabel", (sess.over or isTerminal) and "Best Move: Game Over" or "Best Move: Waiting...")
 		setUiLabel("EvalLabel", "Eval: --")
 		setUiLabel("LineLabel", "Line: --")
-		setPulseStatus(sess.over and "Finished" or "Waiting", kindCap .. " · " .. turnTxt)
-		updateEngineBadge((sess.over and "Game Over" or waitTxt) .. turboTag, turboTag ~= "" and "turbo" or "idle")
+		setPulseStatus((sess.over or isTerminal) and "Finished" or "Waiting", kindCap .. " · " .. turnTxt)
+		updateEngineBadge(((sess.over or isTerminal) and "Game Over" or waitTxt) .. turboTag, (STATE.Opp.turboActive and CONFIG.AntiEngineTurbo and sess.kind == "online") and "turbo" or "idle")
 	end
 end
 
@@ -3872,33 +4766,46 @@ triggerRecalc = function(force)
 	if not sess or sess.kind == "idle" or not sess.engine then
 		if STATE.LastKey ~= "IDLE" or STATE.LastSessionRef ~= nil then
 			STATE.LastSessionRef = nil
+			STATE.LastSessionId = nil
 			STATE.SessionStartedAt = 0
 			STATE.LastKey = "IDLE"
+			STATE.TerminalKey = ""
 			STATE.LastAutoKey = ""
+			STATE.AutoGen += 1
 			STATE.AutoPending = false
 			STATE.AutoRetryAfter = 0
 			STATE.SearchGen += 1
 			STATE.Searching = false
+			STATE.ActiveStage = nil
 			STATE.CurrentResult = nil
 			STATE.LastArrowSig = ""
+			cancelPrefetchState()
 			updateHudReadout(sess, nil, false)
 		end
 		return
 	end
 
 	-- Cleanly reset stale AutoPlay / turn state whenever a brand-new game session starts (rematch, bot, tournament round)!
-	if sess ~= STATE.LastSessionRef then
+	local curSessId = tostring(sess.id or "")
+	if sess ~= STATE.LastSessionRef or curSessId ~= STATE.LastSessionId then
 		STATE.LastSessionRef = sess
+		STATE.LastSessionId = curSessId
 		STATE.SessionStartedAt = os.clock()
 		STATE.LastAutoKey = ""
+		STATE.AutoGen += 1
 		STATE.AutoPending = false
 		STATE.AutoPendingAt = 0
+		STATE.AutoExpectedWait = 0
 		STATE.AutoRetryAfter = 0
 		STATE.LastKey = ""
+		STATE.TerminalKey = ""
 		STATE.CurrentResult = nil
 		STATE.LastEvalCp = nil
+		STATE.LastEvalFlip = nil
 		STATE.MissingResultSince = 0
 		STATE.LastArrowSig = ""
+		STATE.ActiveStage = nil
+		updateEvalBarVisual(0, nil, STATE.Board and STATE.Board.flipped == true)
 		force = true
 	end
 
@@ -3906,10 +4813,10 @@ triggerRecalc = function(force)
 	local eng = (sess.kind == "analysis" or sess.kind == "review") and sess:engineAt(sess.viewPly) or sess.engine
 	local fen = eng:getFen()
 	local isMyTurnNow = (type(sess.isMyTurn) == "function") and (sess:isMyTurn() == true) or false
-	local plyCount = (sess.ucis and #sess.ucis) or 0
+	local plyCount = getSessionPly(sess)
 	local key = table.concat({
 		tostring(sess),
-		tostring(sess.id or ""),
+		curSessId,
 		tostring(sess.kind),
 		tostring(sess.myColor),
 		tostring(isMyTurnNow),
@@ -3919,6 +4826,7 @@ triggerRecalc = function(force)
 		fen,
 		CONFIG.EngineMode,
 		CONFIG.PlayStyle,
+		tostring(CONFIG.AutoAdapt),
 		tostring(CONFIG.StockfishDepth),
 		tostring(CONFIG.LuauMaxDepth),
 		tostring(CONFIG.OnlyMyTurn),
@@ -3926,6 +4834,10 @@ triggerRecalc = function(force)
 
 	if not force and key == STATE.LastKey then
 		return
+	end
+	if force then
+		STATE.AutoGen += 1
+		STATE.AutoPending = false
 	end
 	STATE.LastKey = key
 	STATE.SearchGen += 1
@@ -3936,18 +4848,38 @@ triggerRecalc = function(force)
 
 	if sess.over or not CONFIG.Enabled then
 		STATE.Searching = false
+		STATE.ActiveStage = nil
+		STATE.TerminalKey = ""
 		updateHudReadout(sess, nil, false)
 		return
 	end
 
 	if CONFIG.OnlyMyTurn and sess.myColor ~= nil and not sess:isMyTurn() then
 		STATE.Searching = false
+		STATE.ActiveStage = nil
+		STATE.TerminalKey = ""
 		updateHudReadout(sess, nil, false)
 		return
 	end
 
+	-- Terminal position guard (checkmate/stalemate): skip API calls & Watchdog #2 spam in Analysis/Review
+	local okTerm, isTerminal = pcall(function()
+		local tb = PureChess.new(fen)
+		return #tb:legalMoves() == 0
+	end)
+	if okTerm and isTerminal then
+		STATE.TerminalKey = key
+		STATE.Searching = false
+		STATE.ActiveStage = nil
+		STATE.MissingResultSince = 0
+		updateHudReadout(sess, nil, false)
+		return
+	end
+	STATE.TerminalKey = ""
+
 	STATE.Searching = true
 	STATE.SearchStartedAt = os.clock()
+	STATE.ActiveStage = nil
 	STATE.ActiveEngine = (CONFIG.EngineMode == "Luau") and "Offline Luau"
 		or ((CONFIG.EngineMode == "LocalWS") and "Local Stockfish WS"
 			or ((hasVpsConfigured() and os.clock() >= STATE.VpsCooldownUntil) and "Stockfish 19 VPS" or "Stockfish Cloud"))
@@ -3965,6 +4897,7 @@ triggerRecalc = function(force)
 			return
 		end
 		STATE.Searching = false
+		STATE.ActiveStage = nil
 		if not okSolve then
 			res = nil
 		end
@@ -3976,17 +4909,46 @@ triggerRecalc = function(force)
 				STATE.LastEvalCp = rawTopCp
 				STATE.LastMyTurnResult = res
 
-				-- Opponent Blunder Check (engines never hang >= 2.00 pawns in playable positions)
-				if sess.kind == "online" and sess.myColor and rawTopCp ~= nil and res.mate == nil then
+				local isSfSrc = isStockfishSource(res.source)
+
+				-- Pre-seed expectedByPly[plyNow + 2] for Stockfish results so <0.13s premove +2 ply jumps are never missed!
+				if sess.kind == "online" and isSfSrc and type(res.best) == "string" and #res.best >= 4 and type(res.ponder) == "string" and #res.ponder >= 4 then
+					pcall(function()
+						local sb = PureChess.new(fen)
+						local sm = sb:moveFromUci(res.best)
+						if sm then
+							sb:makeMove(sm)
+							STATE.Opp.expectedByPly[plyCount + 2] = {
+								uci = res.ponder,
+								myUci = res.best,
+								myCapture = res.isCapture == true,
+								myToSq = string.sub(res.best, 3, 4),
+								oppFen = sb:getFen(),
+								source = res.source,
+							}
+						end
+					end)
+				end
+
+				-- Opponent Blunder Check: gated on ply >= 9, Stockfish-only prev+cur sources, oppUci ~= exp.uci, and rolling capped penalty
+				if sess.kind == "online" and sess.myColor and isSfSrc and rawTopCp ~= nil and res.mate == nil then
 					local myEvalNow = rawTopCp * sess.myColor
 					local prevMe = STATE.Opp.lastEvalForMe
-					if prevMe ~= nil and math.abs(prevMe) < 500 and (myEvalNow - prevMe) >= 200 then
-						STATE.Opp.blunders = (STATE.Opp.blunders or 0) + 1
-						STATE.Opp.streak = 0
-						recomputeOpponentSuspicion()
-						setUiLabel("OpponentLabel", formatOpponentLabel(sess))
+					local prevSf = isStockfishSource(STATE.Opp.lastEvalSource)
+					if plyCount >= 9 and prevSf and prevMe ~= nil and math.abs(prevMe) < 500 and (myEvalNow - prevMe) >= 200 then
+						local oppUci = (type(sess.ucis) == "table" and plyCount >= 1) and sess.ucis[plyCount] or nil
+						local oppExp = STATE.Opp.expectedByPly[plyCount]
+						local matchedExp = (type(oppExp) == "table" and oppExp.uci ~= nil and oppUci == oppExp.uci)
+						if not matchedExp then
+							STATE.Opp.blunders = (STATE.Opp.blunders or 0) + 1
+							STATE.Opp.blunderPenalty = math.min(56, (STATE.Opp.blunderPenalty or 0) + 28)
+							STATE.Opp.streak = 0
+							recomputeOpponentSuspicion()
+							setUiLabel("OpponentLabel", formatOpponentLabel(sess))
+						end
 					end
 					STATE.Opp.lastEvalForMe = myEvalNow
+					STATE.Opp.lastEvalSource = res.source
 				end
 			end
 			STATE.ActiveEngine = res.engineLabel or res.source or CONFIG.EngineMode
@@ -4021,18 +4983,20 @@ local function tickWatchdogs(app, sess, now)
 		end
 	end
 
-	-- 1. Hard Search Timeout Watchdog (recovers if anything hangs mid-search)
+	-- 1. Hard Search Timeout Watchdog (aligned above VPS+Cloud+Luau chain; penalizes ONLY stalled ActiveStage)
 	if STATE.Searching then
-		local maxWait = (CONFIG.AntiEngineTurbo and STATE.Opp.turboActive) and 2.2 or 4.2
+		local maxWait = (CONFIG.AntiEngineTurbo and STATE.Opp.turboActive) and 3.5 or 6.0
 		if STATE.SearchStartedAt > 0 and (now - STATE.SearchStartedAt) > maxWait then
+			local stalledStage = STATE.ActiveStage
 			STATE.SearchGen += 1
 			STATE.Searching = false
-			if hasVpsConfigured() and now >= STATE.VpsCooldownUntil then
+			STATE.ActiveStage = nil
+			if stalledStage == "vps" then
 				STATE.VpsFailStreak += 1
 				if STATE.VpsFailStreak >= 2 then
 					STATE.VpsCooldownUntil = now + 12
 				end
-			else
+			elseif stalledStage == "cloud" then
 				STATE.SfFailStreak += 1
 				if STATE.SfFailStreak >= 2 then
 					STATE.SfCooldownUntil = now + 15
@@ -4044,8 +5008,8 @@ local function tickWatchdogs(app, sess, now)
 		end
 	end
 
-	-- 2. Empty-Result Recovery Watchdog (auto-retriggers if turn has no result)
-	if needMove and (not STATE.Searching) and STATE.CurrentResult == nil then
+	-- 2. Empty-Result Recovery Watchdog (skips terminal checkmate/stalemate plies!)
+	if needMove and (not STATE.Searching) and STATE.CurrentResult == nil and STATE.TerminalKey ~= STATE.LastKey then
 		if STATE.MissingResultSince == 0 then
 			STATE.MissingResultSince = now
 		elseif (now - STATE.MissingResultSince) >= 0.75 then
@@ -4058,10 +5022,11 @@ local function tickWatchdogs(app, sess, now)
 		STATE.MissingResultSince = 0
 	end
 
-	-- 3. AutoPlay Deadlock Watchdog (clears stale AutoPending if anything interrupted click loop)
+	-- 3. AutoPlay Deadlock Watchdog (clears stale AutoPending & bumps AutoGen so old coroutines cannot clobber)
 	if STATE.AutoPending then
 		local maxPending = math.max((STATE.AutoExpectedWait or 0) + 5.0, math.max(CONFIG.AutoDelayMin or 1, CONFIG.AutoDelayMax or 5) + 5.5)
 		if STATE.AutoPendingAt > 0 and (now - STATE.AutoPendingAt) > maxPending then
+			STATE.AutoGen += 1
 			STATE.AutoPending = false
 			STATE.AutoExpectedWait = 0
 			STATE.LastAutoKey = ""
@@ -4072,6 +5037,31 @@ local function tickWatchdogs(app, sess, now)
 	end
 end
 
+-- Cross-Server Teleport Persistence (re-queues BeverlyHub automatically when RoChess teleports into a match)
+if LocalPlayer and LocalPlayer.OnTeleport then
+	trackConn(LocalPlayer.OnTeleport:Connect(function(tpState)
+		if not STATE.Alive or not CONFIG.AutoReloadOnTeleport then
+			return
+		end
+		if tpState == Enum.TeleportState.Failed then
+			STATE.TeleportQueued = false
+			return
+		end
+		if STATE.TeleportQueued then
+			return
+		end
+		if tpState == Enum.TeleportState.Started or tpState == Enum.TeleportState.InProgress then
+			if type(queueOnTeleport) == "function" then
+				STATE.TeleportQueued = true
+				local okQ = pcall(queueOnTeleport, getTeleportLoaderSource())
+				if not okQ then
+					STATE.TeleportQueued = false
+				end
+			end
+		end
+	end))
+end
+
 -- Cleanup routine (wired bidirectionally with Library:OnUnload)
 local unloading = false
 cleanup = function()
@@ -4079,6 +5069,8 @@ cleanup = function()
 	unloading = true
 	STATE.Alive = false
 	STATE.SearchGen += 1
+	STATE.AutoGen += 1
+	cancelPrefetchState()
 	for _, conn in ipairs(STATE.Connections) do
 		pcall(function() conn:Disconnect() end)
 	end
@@ -4098,16 +5090,21 @@ end
 globalEnv.__RoChessHubCleanup = cleanup
 Library:OnUnload(cleanup)
 
--- Startup & Heartbeat Loop
+-- Startup (persistent retry while STATE.Alive) & Per-Frame Ply Watcher + 0.10s Periodic Loop
 task.spawn(function()
+	-- Yield 1 frame so SaveManager autoload deferred callbacks settle before initial recalc
+	task.wait()
+	syncConfigFromUI()
+
 	local tries = 0
-	while STATE.Alive and not connectToRoChess() and tries < 50 do
+	while STATE.Alive and not connectToRoChess() do
 		tries += 1
-		task.wait(0.2)
+		if tries == 20 then
+			setUiLabel("MatchLabel", "Match: Waiting for RoChess client...")
+		end
+		task.wait(tries <= 20 and 0.25 or 1.0)
 	end
-	if not STATE.Alive then return end
-	if not STATE.App then
-		setUiLabel("MatchLabel", "Match: RoChess client not detected")
+	if not STATE.Alive or not STATE.App then
 		return
 	end
 
@@ -4116,17 +5113,37 @@ task.spawn(function()
 	triggerRecalc(true)
 
 	local lastCheck = 0
+	local lastFramePly = -1
+	local lastFrameSess = nil
+	local lastFrameTurn = nil
+
 	trackConn(RunService.RenderStepped:Connect(function()
 		if not STATE.Alive then return end
 		local app = STATE.App
 		STATE.Board = app and app.board
 		renderOverlay()
 		local now = os.clock()
-		if now - lastCheck >= 0.12 then
-			lastCheck = now
-			local sess = app and app.session
+		local sess = app and app.session
+
+		-- Lightweight per-frame ply/turn change detector (catches <0.13s premoves & +2 ply jumps immediately)
+		local curPly = getSessionPly(sess)
+		local curTurn = (sess and type(sess.isMyTurn) == "function") and (sess:isMyTurn() == true) or nil
+		local plyChanged = (sess ~= lastFrameSess) or (curPly ~= lastFramePly) or (curTurn ~= lastFrameTurn)
+		if plyChanged then
+			lastFrameSess = sess
+			lastFramePly = curPly
+			lastFrameTurn = curTurn
 			updateOpponentDetector(sess)
 			triggerRecalc(false)
+		end
+
+		-- Periodic watchdogs & clock checks at 0.10s
+		if now - lastCheck >= 0.10 then
+			lastCheck = now
+			if not plyChanged then
+				updateOpponentDetector(sess)
+				triggerRecalc(false)
+			end
 			tickWatchdogs(app, sess, now)
 			tickAutoFindMatch(app, sess, now)
 		end
