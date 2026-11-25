@@ -31,7 +31,7 @@ end
 
 local LIB_BASE = "https://raw.githubusercontent.com/bevankeren/BeverlyLIB/main/"
 local REMOTE_SCRIPT_URL = "https://raw.githubusercontent.com/bevankeren/rochess/main/rochess.lua"
-local HUB_VERSION = "2.0.0"
+local HUB_VERSION = "2.1.0"
 
 -- ============================================================================
 -- 1. CONFIGURATION & RUNTIME STATE
@@ -66,6 +66,13 @@ local CONFIG = {
 	AutoFindMatch = false, -- OFF by default
 	AutoFindTc = "Selected", -- "Selected" or TC id ("1+0", "3+2", etc.)
 	AutoReloadOnTeleport = true, -- Re-queue loader automatically on cross-server match teleports
+	-- Auto-Farm Elo (Natural Elo Grinder + Anti-Rungkat Controlled Loss)
+	AutoFarm = false, -- OFF by default
+	FarmLossMode = "BlunderResign", -- "BlunderResign" | "PlayWeak" | "LateResign"
+	FarmLossAfterElo = 45, -- Target Elo gained before 1 controlled loss (with +-20% natural jitter)
+	FarmStopAtElo = 0, -- Stop auto-farming once rating reaches target (0 = unlimited)
+	FarmHumanBreather = true, -- Periodic 20-45s human breather every 5-8 games
+	FarmKeepPositive = true, -- Anti-Rungkat Guard: defer throw if expected Elo loss is unsafe
 }
 
 local STATE = {
@@ -85,7 +92,7 @@ local STATE = {
 	ActiveStage = nil, -- "vps" | "cloud" | "luau" | "ws" | nil
 	MissingResultSince = 0,
 	ActiveEngine = "Ready",
-	ActiveEngineKind = "idle", -- "idle" | "thinking" | "vpssf" | "gm" | "stockfish" | "localws" | "luau" | "fallback" | "book" | "puzzle" | "turbo"
+	ActiveEngineKind = "idle", -- "idle" | "thinking" | "vpssf" | "gm" | "farm" | "stockfish" | "localws" | "luau" | "fallback" | "book" | "puzzle" | "turbo"
 	CurrentResult = nil, -- { best, ponder, evalCp, mate, depth, source, ms, pv, san, fromSq, toSq, promo }
 	LastMyTurnResult = nil,
 	LastEvalCp = nil,
@@ -115,6 +122,7 @@ local STATE = {
 	PrefetchDone = nil, -- { done = false, res = nil, fen4 = "", cacheKey = "", gen = 0 }
 	-- Opponent Engine Detector, Clock Pressure & Dynamic Auto-Adapt state
 	Opp = {
+		gameRef = nil,
 		gameId = nil,
 		lastPly = -1,
 		oppTurnStartAt = 0,
@@ -141,14 +149,43 @@ local STATE = {
 		adaptTier = nil,
 		lastAdaptPly = -1,
 	},
-	-- Auto Find Match state
+	-- Auto Find Match & Auto-Farm Elo state
 	AutoFindOverAt = 0,
 	AutoFindLastQueueAt = 0,
+	Farm = {
+		data = nil,
+		activeClass = nil,
+		gameRef = nil,
+		gameId = nil,
+		gameAccounted = false,
+		settlingGame = false,
+		preMyRating = nil,
+		preOppRating = nil,
+		preProv = false,
+		throwArmed = false,
+		phase = "idle", -- "idle" | "opening" | "blunder" | "weak" | "resigning"
+		throwStartMove = 10,
+		maxBlunderMoves = 6,
+		resignMinMove = 14,
+		blunderMovesPlayed = 0,
+		lastBlunderPly = -1,
+		resignGen = 0,
+		resignPending = false,
+		deferReason = nil,
+		breakUntil = 0,
+		nextQueueDelay = 0,
+		idleSince = 0,
+		lastUiUpdate = 0,
+		autoEnabledAutoPlay = false,
+		autoEnabledAutoFind = false,
+	},
 	Cache = {},
 	CacheOrder = {},
 	CacheMax = 384,
 	WsConn = nil,
 }
+
+local Farm = {} -- Populated after UI helpers; single top-level module for Auto-Farm Elo
 
 local function trackConn(conn)
 	table.insert(STATE.Connections, conn)
@@ -1585,6 +1622,254 @@ do
 			source = "Luau",
 		}
 	end
+
+	-- Plausible Human-Like Blunder / Weak-Play Picker (never touches main TT; ~4-12ms)
+	function PureChess.pickHumanBlunder(fen, minDropCp, maxDropCp, opts)
+		local t0 = os.clock()
+		local board = PureChess.new(fen)
+		local legal = board:legalMoves()
+		local cnt = #legal
+		if cnt == 0 then
+			return nil
+		end
+
+		local mySide = board.side
+		local oppSide = -mySide
+		local minDrop = minDropCp or 250
+		local maxDrop = maxDropCp or 650
+		local allowMateIn1 = (type(opts) == "table" and opts.allowMateIn1 == true)
+		local inCheckNow = board:inCheck()
+
+		local totalPieces = 0
+		for i = 1, 64 do
+			if board.board[SQUARES[i]] ~= EMPTY then
+				totalPieces += 1
+			end
+		end
+
+		if cnt == 1 then
+			local onlyM = legal[1]
+			local onlyUci = PureChess.moveToUci(onlyM)
+			local sc = board:evaluate() * mySide
+			return {
+				best = onlyUci,
+				ponder = nil,
+				evalCp = sc,
+				mate = nil,
+				depth = 1,
+				ms = math.floor((os.clock() - t0) * 1000),
+				pv = { onlyUci },
+				san = board:moveToSan(onlyM),
+				source = "FarmBlunder",
+				blunderDropCp = 0,
+				engineLabel = "Farm · Forced",
+				engineKind = "farm",
+			}
+		end
+
+		local nodes = 0
+		local lastYield = t0
+		local cands = {}
+		local bestScore = -INF
+		local oppBuf = {}
+		local capBuf = {}
+
+		for i = 1, cnt do
+			local m = legal[i]
+			local fromSq = band(m, 127)
+			local toSq = extract(m, 7, 7)
+			local flag = extract(m, 17, 3)
+			local pc = board.board[fromSq]
+			local pt = abs(pc)
+			local isCap = (board.board[toSq] ~= EMPTY) or (flag == F_EP)
+			local fromRank = (fromSq - 22) // 10
+			local toRank = (toSq - 22) // 10
+			local isAdvance = (mySide == 1 and toRank > fromRank) or (mySide == -1 and toRank < fromRank)
+			local isEdgeRook = (pt == ROOK) and (not isCap) and (fromRank == toRank) and (fromRank == 0 or fromRank == 7)
+
+			board:makeMove(m)
+			local givesCheck = board:inCheck()
+
+			local oppCnt = board:genPseudo(oppBuf, false)
+			local oppLegal = 0
+			local worstForMe = INF
+			local allowsMate1 = false
+
+			for j = 1, oppCnt do
+				local r = oppBuf[j]
+				board:makeMove(r)
+				if not board:isAttacked(board.kingSq[oppSide], mySide) then
+					oppLegal += 1
+					nodes += 1
+					local scoreForMe
+					if board:inCheck() then
+						local myReplies = board:legalMoves()
+						if #myReplies == 0 then
+							allowsMate1 = true
+							scoreForMe = -MATE + 2
+						else
+							scoreForMe = board:evaluate()
+						end
+					else
+						scoreForMe = board:evaluate()
+						local cCnt = board:genPseudo(capBuf, true)
+						for k = 1, cCnt do
+							local cm = capBuf[k]
+							board:makeMove(cm)
+							if not board:isAttacked(board.kingSq[mySide], oppSide) then
+								local recScore = -board:evaluate()
+								if recScore > scoreForMe then
+									scoreForMe = recScore
+								end
+							end
+							board:undoMove()
+						end
+					end
+					if scoreForMe < worstForMe then
+						worstForMe = scoreForMe
+					end
+				end
+				board:undoMove()
+				if band(nodes, 1023) == 0 then
+					local now = os.clock()
+					if now - lastYield >= 0.012 then
+						lastYield = now
+						task.wait()
+					end
+				end
+			end
+
+			local deliversMate = false
+			if oppLegal == 0 then
+				if givesCheck then
+					deliversMate = true
+					worstForMe = MATE - 1
+				else
+					worstForMe = 0
+				end
+			end
+			board:undoMove()
+
+			if worstForMe > bestScore then
+				bestScore = worstForMe
+			end
+			cands[#cands + 1] = {
+				m = m,
+				score = worstForMe,
+				allowsMate1 = allowsMate1,
+				deliversMate = deliversMate,
+				pt = pt,
+				flag = flag,
+				isCap = isCap,
+				givesCheck = givesCheck,
+				isAdvance = isAdvance,
+				isEdgeRook = isEdgeRook,
+			}
+		end
+
+		local midDrop = (minDrop + maxDrop) * 0.5
+		local dropSpan = math.max(80, maxDrop - minDrop)
+		for _, c in ipairs(cands) do
+			local drop = math.max(0, bestScore - c.score)
+			c.drop = drop
+			local p = 0
+			if c.pt == KING and c.flag ~= F_OO and c.flag ~= F_OOO and totalPieces > 12 and not inCheckNow then
+				p -= 400
+			end
+			if c.isEdgeRook then
+				p -= 120
+			end
+			if drop > 950 then
+				p -= 80
+			end
+			if c.isAdvance then
+				p += 80
+			end
+			if c.isCap or c.givesCheck then
+				p += 70
+			end
+			if c.pt == PAWN or c.pt == KNIGHT or c.pt == BISHOP or c.pt == QUEEN then
+				p += 45
+			end
+			p += 50 * math.max(0, 1 - abs(drop - midDrop) / dropSpan)
+			c.plaus = p
+		end
+
+		local function pickFromPool(pool)
+			if #pool == 0 then
+				return nil
+			end
+			table.sort(pool, function(a, b)
+				return a.plaus > b.plaus
+			end)
+			local topN = math.min(#pool, 3)
+			local weights = { 55, 30, 15 }
+			local totalW = 0
+			for idx = 1, topN do
+				totalW += weights[idx]
+			end
+			local roll = math.random() * totalW
+			local acc = 0
+			for idx = 1, topN do
+				acc += weights[idx]
+				if roll <= acc then
+					return pool[idx]
+				end
+			end
+			return pool[1]
+		end
+
+		local pool1, pool2, pool3, pool4 = {}, {}, {}, {}
+		for _, c in ipairs(cands) do
+			if not c.deliversMate then
+				pool4[#pool4 + 1] = c
+				if not c.allowsMate1 and c.drop >= minDrop and c.drop <= maxDrop then
+					pool1[#pool1 + 1] = c
+				elseif not c.allowsMate1 and c.drop >= 130 and c.drop <= 880 then
+					pool2[#pool2 + 1] = c
+				end
+				if (allowMateIn1 or not c.allowsMate1) and c.drop >= 50 then
+					pool3[#pool3 + 1] = c
+				end
+			end
+		end
+
+		local picked = pickFromPool(pool1) or pickFromPool(pool2) or pickFromPool(pool3)
+		if not picked then
+			if #pool4 > 0 then
+				table.sort(pool4, function(a, b)
+					return a.score < b.score
+				end)
+				picked = pool4[1]
+			else
+				picked = cands[1]
+			end
+		end
+
+		local bestUci = PureChess.moveToUci(picked.m)
+		local whiteScore = picked.score * mySide
+		local mateVal = nil
+		if abs(whiteScore) > MATE - 200 then
+			local pliesToMate = MATE - abs(whiteScore)
+			local movesToMate = math.max(1, math.ceil(pliesToMate / 2))
+			mateVal = (whiteScore > 0) and movesToMate or -movesToMate
+		end
+
+		return {
+			best = bestUci,
+			ponder = nil,
+			evalCp = whiteScore,
+			mate = mateVal,
+			depth = 2,
+			ms = math.floor((os.clock() - t0) * 1000),
+			pv = { bestUci },
+			san = board:moveToSan(picked.m),
+			source = "FarmBlunder",
+			blunderDropCp = picked.drop,
+			engineLabel = string.format("Farm · Blunder (-%dcp)", picked.drop),
+			engineKind = "farm",
+		}
+	end
 end
 
 -- ============================================================================
@@ -2020,6 +2305,10 @@ local function getEffectivePlayStyle(session, turbo, suspect, evalOverride, allo
 	if userStyle == "Full" or not session or session.kind ~= "online" then
 		return userStyle, false
 	end
+	-- During an armed Auto-Farm controlled-loss game, suppress AutoAdapt / Turbo escalation
+	if STATE.Farm.throwArmed and CONFIG.AutoFarm then
+		return userStyle, false
+	end
 
 	local o = STATE.Opp
 	if turbo or o.engineDetected or suspect then
@@ -2450,8 +2739,19 @@ local function solvePosition(fen, session, gen, onStage)
 		end
 	end
 
-	local turbo = CONFIG.AntiEngineTurbo and STATE.Opp.turboActive and session and session.kind == "online"
-	local suspect = CONFIG.AntiEngineTurbo and STATE.Opp.suspect and session and session.kind == "online"
+	-- Auto-Farm Controlled-Loss Throw Phase routing (BlunderResign / PlayWeak / LateResign)
+	if Farm.shouldUseThrowMove and Farm.shouldUseThrowMove(session) then
+		reportStage("Farm · Blunder", "farm", "luau")
+		local throwRes = Farm.pickThrowMove(fen, session, isCancelled)
+		if throwRes and not isCancelled() then
+			STATE.ActiveStage = nil
+			return throwRes
+		end
+	end
+
+	local farmThrowSuppress = (CONFIG.AutoFarm and STATE.Farm.throwArmed == true)
+	local turbo = (not farmThrowSuppress) and CONFIG.AntiEngineTurbo and STATE.Opp.turboActive and session and session.kind == "online"
+	local suspect = (not farmThrowSuppress) and CONFIG.AntiEngineTurbo and STATE.Opp.suspect and session and session.kind == "online"
 	local prof = computeQueryProfile(session, turbo, suspect)
 	local liveF4 = fen4Key(fen)
 
@@ -2502,6 +2802,8 @@ local function solvePosition(fen, session, gen, onStage)
 					return finalizeCacheHit(awaitedHit, math.floor((os.clock() - tAwait0) * 1000))
 				end
 			end
+			-- v2.1.0 Fix #5: cancel timed-out or lower-MultiPV pBox before issuing live VPS call
+			cancelPrefetchState()
 		elseif pBox and not pBox.done and pBox.fen4 ~= liveF4 then
 			-- Non-matching speculative prefetch: cancel client-side immediately so live request preempts cleanly
 			cancelPrefetchState()
@@ -2603,8 +2905,11 @@ local function solvePosition(fen, session, gen, onStage)
 	if not isCancelled() then
 		STATE.ActiveStage = nil
 		if res then
-			local grp = deriveResultCacheGroup(res)
-			cachePut(fenCacheKey(fen, grp), res)
+			-- v2.1.0 Fix #6a: never cache Book picks so Luau Opening Book stays varied across games
+			if res.source ~= "Book" then
+				local grp = deriveResultCacheGroup(res)
+				cachePut(fenCacheKey(fen, grp), res)
+			end
 			res = applyGmMoveShaper(fen, session, res, turbo, suspect)
 		end
 	end
@@ -3086,6 +3391,7 @@ local Window = Library:CreateWindow({
 
 local Tabs = {
 	Main = Window:AddTab("Engine", "cpu", "Board assist, engine mode, and live evaluation"),
+	Farm = Window:AddTab("Auto-Farm", "trending-up", "AFK Elo farming, anti-rungkat controlled losses, and stats"),
 	Settings = Window:AddTab("Settings", "settings", "Keybinds, offline tuning, themes, and configs"),
 }
 
@@ -3178,6 +3484,18 @@ local function syncConfigFromUI()
 		CONFIG.AutoFindTc = Options.AutoFindTc.Value
 	end
 	CONFIG.AutoReloadOnTeleport = (Toggles.AutoReloadOnTeleport == nil) or (Toggles.AutoReloadOnTeleport.Value == true)
+	CONFIG.AutoFarm = (Toggles.AutoFarm ~= nil) and (Toggles.AutoFarm.Value == true)
+	if Options.FarmLossMode and type(Options.FarmLossMode.Value) == "string" then
+		CONFIG.FarmLossMode = Options.FarmLossMode.Value
+	end
+	if Options.FarmLossAfterElo and tonumber(Options.FarmLossAfterElo.Value) then
+		CONFIG.FarmLossAfterElo = math.clamp(math.floor(tonumber(Options.FarmLossAfterElo.Value)), 20, 150)
+	end
+	if Options.FarmStopAtElo and tonumber(Options.FarmStopAtElo.Value) then
+		CONFIG.FarmStopAtElo = math.clamp(math.floor(tonumber(Options.FarmStopAtElo.Value)), 0, 3000)
+	end
+	CONFIG.FarmHumanBreather = (Toggles.FarmHumanBreather == nil) or (Toggles.FarmHumanBreather.Value == true)
+	CONFIG.FarmKeepPositive = (Toggles.FarmKeepPositive == nil) or (Toggles.FarmKeepPositive.Value == true)
 	STATE.LastArrowSig = ""
 end
 
@@ -3481,6 +3799,93 @@ MenuGroup:AddButton({
 	end,
 })
 
+-- Tab 2: Auto-Farm Elo (wrapped in do..end so zero extra top-level locals are consumed)
+do
+	local FarmLeft = Tabs.Farm:AddGroupbox({
+		Side = "Left",
+		Name = "Elo Auto-Farm",
+		IconName = "trending-up",
+	})
+
+	FarmLeft:AddToggle("AutoFarm", {
+		Text = "Enable Auto-Farm Elo",
+		Default = false,
+		Risky = true,
+		Tooltip = "Automatically plays rated matches, tracks Elo across server teleports, and mixes in safe controlled losses so win streaks stay natural.",
+	})
+
+	FarmLeft:AddDropdown("FarmLossMode", {
+		Text = "Loss Style",
+		Values = {
+			BlunderResign = "Blunder + Resign (Natural)",
+			PlayWeak = "Play Weak (~900 Elo)",
+			LateResign = "Late Resign (Move 16-24)",
+		},
+		Default = "BlunderResign",
+		Tooltip = "How a scheduled controlled loss is played once your +Elo cycle target is reached.",
+	})
+
+	FarmLeft:AddSlider("FarmLossAfterElo", {
+		Text = "Loss After +Elo",
+		Default = 45,
+		Min = 20,
+		Max = 150,
+		Rounding = 0,
+		Suffix = " Elo",
+		Compact = true,
+		Tooltip = "Schedule 1 controlled loss after earning roughly +N Elo (+-20% random jitter). Real losses reset the counter automatically.",
+	})
+
+	FarmLeft:AddSlider("FarmStopAtElo", {
+		Text = "Stop At Target Elo",
+		Default = 0,
+		Min = 0,
+		Max = 3000,
+		Rounding = 0,
+		Suffix = " Elo",
+		Compact = true,
+		Tooltip = "Automatically stop Auto-Farm when your rating reaches this value (0 = no limit).",
+	})
+
+	FarmLeft:AddDivider("AFK Pacing & Protection")
+
+	FarmLeft:AddToggle("FarmHumanBreather", {
+		Text = "Human Breather (20-45s)",
+		Default = true,
+		Tooltip = "Takes a natural 20-45s break every 5-8 games and varies inter-game queue wait (3-9s).",
+	})
+
+	FarmLeft:AddToggle("FarmKeepPositive", {
+		Text = "Anti-Rungkat Guard",
+		Default = true,
+		Tooltip = "Defers any scheduled loss if opponent is much lower rated or expected Elo loss would exceed 40% of cycle profit (guarantees net-positive Elo).",
+	})
+
+	local FarmRight = Tabs.Farm:AddGroupbox({
+		Side = "Right",
+		Name = "Farm Session",
+		IconName = "activity",
+	})
+
+	FarmRight:AddLabel("FarmStatusLabel", { Text = "Status: Standby", DoesWrap = false })
+	FarmRight:AddLabel("FarmRatingLabel", { Text = "Rating: -- (Net +0 Elo)", DoesWrap = false })
+	FarmRight:AddLabel("FarmRecordLabel", { Text = "Record: 0W · 0L · 0D (0 Ctrl)", DoesWrap = false })
+	FarmRight:AddLabel("FarmCycleLabel", { Text = "Loss Cycle: +0 / ~45 Elo", DoesWrap = false })
+	FarmRight:AddLabel("FarmGuardLabel", { Text = "Guard: Ready", DoesWrap = true })
+
+	FarmRight:AddDivider("Actions")
+
+	FarmRight:AddButton("Reset Farm Stats", function()
+		if Farm.resetStats then
+			Farm.resetStats()
+		end
+	end):AddButton("Disarm Throw", function()
+		if Farm.disarmThrow then
+			Farm.disarmThrow("Manual disarm")
+		end
+	end)
+end
+
 Library.ToggleKeybind = Options.MenuKeybind
 
 -- Hook UI callbacks (debounced with 1-frame coalescing so SaveManager autoload never triggers HTTP storms)
@@ -3571,6 +3976,58 @@ Toggles.AutoFindMatch:OnChanged(function(val)
 end)
 Options.AutoFindTc:OnChanged(syncConfigFromUI)
 Toggles.AutoReloadOnTeleport:OnChanged(syncConfigFromUI)
+Toggles.AutoFarm:OnChanged(function(val)
+	syncConfigFromUI()
+	if val then
+		local enabledAny = false
+		if Toggles.AutoPlay and not Toggles.AutoPlay.Value then
+			STATE.Farm.autoEnabledAutoPlay = true
+			Toggles.AutoPlay:SetValue(true)
+			enabledAny = true
+		end
+		if Toggles.AutoFindMatch and not Toggles.AutoFindMatch.Value then
+			STATE.Farm.autoEnabledAutoFind = true
+			Toggles.AutoFindMatch:SetValue(true)
+			enabledAny = true
+		end
+		STATE.Farm.idleSince = os.clock()
+		if Farm.refreshUi then Farm.refreshUi(STATE.App, STATE.App and STATE.App.session) end
+		if Farm.saveState then Farm.saveState(false) end
+		if enabledAny then
+			pcall(function()
+				Library:Notify({
+					Title = "Auto-Farm Elo Enabled",
+					Description = "Auto Play & Auto Find Match turned ON automatically with Anti-Rungkat protection.",
+					Time = 3.5,
+				})
+			end)
+		end
+	else
+		if Farm.disarmThrow then
+			Farm.disarmThrow("Auto-Farm disabled")
+		end
+		STATE.Farm.breakUntil = 0
+		if Farm.clearResume then
+			Farm.clearResume()
+		end
+		if Farm.refreshUi then Farm.refreshUi(STATE.App, STATE.App and STATE.App.session) end
+	end
+end)
+Options.FarmLossMode:OnChanged(function()
+	syncConfigFromUI()
+	if Farm.refreshUi then Farm.refreshUi(STATE.App, STATE.App and STATE.App.session) end
+end)
+Options.FarmLossAfterElo:OnChanged(function()
+	syncConfigFromUI()
+	if Farm.onLossTargetChanged then Farm.onLossTargetChanged() end
+	if Farm.refreshUi then Farm.refreshUi(STATE.App, STATE.App and STATE.App.session) end
+end)
+Options.FarmStopAtElo:OnChanged(function()
+	syncConfigFromUI()
+	if Farm.refreshUi then Farm.refreshUi(STATE.App, STATE.App and STATE.App.session) end
+end)
+Toggles.FarmHumanBreather:OnChanged(syncConfigFromUI)
+Toggles.FarmKeepPositive:OnChanged(syncConfigFromUI)
 
 -- ThemeManager & SaveManager
 if ThemeManager and SaveManager then
@@ -3711,14 +4168,28 @@ end
 
 local function computeSmartAutoDelay(session, res)
 	local kind = session.kind
-	local turbo = CONFIG.AntiEngineTurbo and STATE.Opp.turboActive and kind == "online"
-	local suspect = CONFIG.AntiEngineTurbo and STATE.Opp.suspect and kind == "online"
+	local isFarmThrow = (CONFIG.AutoFarm and STATE.Farm.throwArmed == true and (STATE.Farm.phase == "blunder" or STATE.Farm.phase == "weak"))
+	local turbo = (not isFarmThrow) and CONFIG.AntiEngineTurbo and STATE.Opp.turboActive and kind == "online"
+	local suspect = (not isFarmThrow) and CONFIG.AntiEngineTurbo and STATE.Opp.suspect and kind == "online"
 	local lo = math.min(CONFIG.AutoDelayMin or 1.0, CONFIG.AutoDelayMax or 5.0)
 	local hi = math.max(CONFIG.AutoDelayMin or 1.0, CONFIG.AutoDelayMax or 5.0)
 	local msLeft = (kind == "online" and session.myColor) and getLiveClockMs(session, session.myColor) or nil
 	local oppMsLeft = (kind == "online" and session.myColor) and getLiveClockMs(session, -session.myColor) or nil
 	local baseMs = (kind == "online") and STATE.Opp.baseMs or nil
 	local isBullet = (baseMs ~= nil and baseMs <= 120000)
+
+	if isFarmThrow then
+		local tcScale = baseMs and math.clamp(baseMs / 180000, 0.30, 1.0) or 1.0
+		local fLo = math.max(0.45, lo * tcScale * 0.85)
+		local fHi = math.max(fLo + 0.35, math.min(hi * tcScale, 4.2))
+		local t = randTriangular(fLo, fHi)
+		if msLeft and msLeft < 15000 then
+			t = math.min(t, 0.45)
+		elseif msLeft and msLeft < 30000 then
+			t = math.min(t, 1.10)
+		end
+		return t, (STATE.Farm.phase == "weak") and "Farm Weak" or "Farm Blunder"
+	end
 
 	if turbo then
 		local fastHi = (msLeft and msLeft < 12000) and 0.22 or 0.32
@@ -3874,6 +4345,9 @@ end
 
 performSafeAutoMove = function(session, res, expectedKey)
 	if STATE.AutoPending or not CONFIG.AutoPlay or not STATE.Alive then
+		return
+	end
+	if STATE.Farm.resignPending or STATE.Farm.phase == "resigning" then
 		return
 	end
 	if os.clock() < (STATE.AutoRetryAfter or 0) then
@@ -4227,9 +4701,11 @@ local function renderOverlay()
 		evalBarFrame.Visible = true
 		evalBarFrame.Size = UDim2.fromOffset(22, sz.Y)
 		evalBarFrame.Position = UDim2.fromOffset(pos.X - 28, pos.Y)
-		if STATE.LastEvalFlip ~= flipped and STATE.CurrentResult then
+		if STATE.LastEvalFlip ~= flipped then
 			STATE.LastEvalFlip = flipped
-			updateEvalBarVisual(STATE.CurrentResult.evalCp, STATE.CurrentResult.mate, flipped)
+			local evCp = (STATE.CurrentResult and STATE.CurrentResult.evalCp) or STATE.EvalWhiteCp or 0
+			local evMate = (STATE.CurrentResult and STATE.CurrentResult.mate) or STATE.EvalMate
+			updateEvalBarVisual(evCp, evMate, flipped)
 		end
 	else
 		evalBarFrame.Visible = false
@@ -4319,6 +4795,7 @@ end
 local BADGE_COLORS = {
 	vpssf = Color3.fromRGB(52, 211, 255),
 	gm = Color3.fromRGB(72, 224, 168),
+	farm = Color3.fromRGB(245, 138, 86),
 	stockfish = Color3.fromRGB(56, 217, 169),
 	turbo = Color3.fromRGB(240, 86, 86),
 	localws = Color3.fromRGB(96, 185, 255),
@@ -4335,8 +4812,9 @@ local function updateEngineBadge(text, kind)
 	engineBadgeDot.BackgroundColor3 = BADGE_COLORS[kind] or BADGE_COLORS.idle
 end
 
-local function resetOpponentTracker(gameId)
+local function resetOpponentTracker(sess, gameId)
 	local o = STATE.Opp
+	o.gameRef = sess
 	o.gameId = gameId
 	o.lastPly = -1
 	o.oppTurnStartAt = os.clock()
@@ -4455,16 +4933,17 @@ end
 
 local function updateOpponentDetector(sess)
 	if not sess or sess.kind ~= "online" or not sess.engine then
-		if STATE.Opp.gameId ~= nil then
-			resetOpponentTracker(nil)
+		if STATE.Opp.gameId ~= nil or STATE.Opp.gameRef ~= nil then
+			resetOpponentTracker(nil, nil)
 		end
 		return
 	end
 
 	local gid = tostring(sess.id or "online")
 	local o = STATE.Opp
-	if o.gameId ~= gid then
-		resetOpponentTracker(gid)
+	-- v2.1.0 Fix #2: track both table ref and id so nil/reused sess.id never leaks prior game state
+	if o.gameRef ~= sess or o.gameId ~= gid then
+		resetOpponentTracker(sess, gid)
 	end
 
 	-- Capture TC baseMs at ply <= 1 (or infer from sess.tc)
@@ -4622,11 +5101,12 @@ local function updateOpponentDetector(sess)
 	end
 	o.clockPressure = clockPressure
 
-	local wantTurbo = CONFIG.AntiEngineTurbo and (o.engineDetected or clockPressure)
+	local farmSuppress = (CONFIG.AutoFarm and STATE.Farm.throwArmed == true)
+	local wantTurbo = (not farmSuppress) and CONFIG.AntiEngineTurbo and (o.engineDetected or clockPressure)
 	o.turboActive = wantTurbo
-	o.turboReason = o.engineDetected and "Engine" or (clockPressure and "Clock" or nil)
+	o.turboReason = (not farmSuppress) and (o.engineDetected and "Engine" or (clockPressure and "Clock" or nil)) or nil
 
-	if o.engineDetected and not o.notified and CONFIG.AntiEngineTurbo then
+	if o.engineDetected and not o.notified and CONFIG.AntiEngineTurbo and not farmSuppress then
 		o.notified = true
 		pcall(function()
 			Library:Notify({
@@ -4640,8 +5120,816 @@ local function updateOpponentDetector(sess)
 	setUiLabel("OpponentLabel", formatOpponentLabel(sess))
 end
 
+-- ============================================================================
+-- 7B. AUTO-FARM ELO ENGINE (PERSISTENT ACROSS TELEPORTS + ANTI-RUNGKAT GUARD)
+-- ============================================================================
+do
+	local FARM_DIR_ROOT = "BeverlyHub"
+	local FARM_DIR = "BeverlyHub/RoChess"
+	local FARM_FILE = "BeverlyHub/RoChess/farm_state.json"
+
+	local function rollJitteredTarget(base)
+		local b = math.clamp(math.floor(tonumber(base) or 45), 20, 150)
+		return math.max(12, math.floor(b * (0.80 + math.random() * 0.40) + 0.5))
+	end
+
+	local function ensureRootData()
+		if type(STATE.Farm.data) ~= "table" then
+			STATE.Farm.data = { version = 1, resume = {}, buckets = {} }
+		end
+		if type(STATE.Farm.data.buckets) ~= "table" then
+			STATE.Farm.data.buckets = {}
+		end
+		if type(STATE.Farm.data.resume) ~= "table" then
+			STATE.Farm.data.resume = {}
+		end
+		return STATE.Farm.data
+	end
+
+	function Farm.loadState()
+		ensureRootData()
+		if type(isfile) ~= "function" or type(readfile) ~= "function" then
+			return
+		end
+		local okF, exists = pcall(isfile, FARM_FILE)
+		if not okF or not exists then
+			return
+		end
+		local okR, raw = pcall(readfile, FARM_FILE)
+		if not okR or type(raw) ~= "string" or #raw < 2 then
+			return
+		end
+		local okD, parsed = pcall(HttpService.JSONDecode, HttpService, raw)
+		if okD and type(parsed) == "table" then
+			if type(parsed.buckets) ~= "table" then parsed.buckets = {} end
+			if type(parsed.resume) ~= "table" then parsed.resume = {} end
+			STATE.Farm.data = parsed
+		end
+	end
+
+	function Farm.saveState(includeResume)
+		local root = ensureRootData()
+		if includeResume then
+			if CONFIG.AutoFarm then
+				root.resume = {
+					active = true,
+					untilTs = os.time() + 120,
+					autoPlay = CONFIG.AutoPlay,
+					autoFind = CONFIG.AutoFindMatch,
+					autoFindTc = CONFIG.AutoFindTc,
+					lossMode = CONFIG.FarmLossMode,
+					lossAfter = CONFIG.FarmLossAfterElo,
+					stopAt = CONFIG.FarmStopAtElo,
+					breather = CONFIG.FarmHumanBreather,
+					keepPos = CONFIG.FarmKeepPositive,
+				}
+			else
+				root.resume = { active = false }
+			end
+		end
+		if type(writefile) ~= "function" then
+			return
+		end
+		pcall(function()
+			if type(makefolder) == "function" then
+				if type(isfolder) ~= "function" or not isfolder(FARM_DIR_ROOT) then
+					pcall(makefolder, FARM_DIR_ROOT)
+				end
+				if type(isfolder) ~= "function" or not isfolder(FARM_DIR) then
+					pcall(makefolder, FARM_DIR)
+				end
+			end
+			local encoded = HttpService:JSONEncode(root)
+			writefile(FARM_FILE, encoded)
+		end)
+	end
+
+	function Farm.clearResume()
+		local root = ensureRootData()
+		root.resume = { active = false }
+		Farm.saveState(false)
+	end
+
+	function Farm.applyTeleportResume()
+		local root = ensureRootData()
+		local r = root.resume
+		if type(r) ~= "table" or not r.active then
+			return
+		end
+		local untilTs = tonumber(r.untilTs) or 0
+		root.resume = { active = false }
+		Farm.saveState(false)
+		if os.time() > untilTs then
+			return
+		end
+		pcall(function()
+			if Options.FarmLossMode and type(r.lossMode) == "string" then Options.FarmLossMode:SetValue(r.lossMode) end
+			if Options.FarmLossAfterElo and tonumber(r.lossAfter) then Options.FarmLossAfterElo:SetValue(r.lossAfter) end
+			if Options.FarmStopAtElo and tonumber(r.stopAt) then Options.FarmStopAtElo:SetValue(r.stopAt) end
+			if Toggles.FarmHumanBreather and type(r.breather) == "boolean" then Toggles.FarmHumanBreather:SetValue(r.breather) end
+			if Toggles.FarmKeepPositive and type(r.keepPos) == "boolean" then Toggles.FarmKeepPositive:SetValue(r.keepPos) end
+			if Options.AutoFindTc and type(r.autoFindTc) == "string" then Options.AutoFindTc:SetValue(r.autoFindTc) end
+			if Toggles.AutoPlay and r.autoPlay ~= false then Toggles.AutoPlay:SetValue(true) end
+			if Toggles.AutoFindMatch and r.autoFind ~= false then Toggles.AutoFindMatch:SetValue(true) end
+			if Toggles.AutoFarm then Toggles.AutoFarm:SetValue(true) end
+			syncConfigFromUI()
+		end)
+	end
+
+	local function classFromTcString(tc)
+		if type(tc) ~= "string" then
+			return nil
+		end
+		local mStr, iStr = string.match(tc, "(%d+%.?%d*)%+(%d+%.?%d*)")
+		if not mStr then
+			return nil
+		end
+		local estSec = (tonumber(mStr) or 0) * 60 + 40 * (tonumber(iStr) or 0)
+		if estSec < 180 then return "bullet" end
+		if estSec < 600 then return "blitz" end
+		return "rapid"
+	end
+
+	function Farm.getSessionClass(app, sess)
+		if sess then
+			local c = sess.class or sess.tcClass or sess.category
+			if type(c) == "string" and (c == "bullet" or c == "blitz" or c == "rapid") then
+				return c
+			end
+			local bMs, iMs = resolveSessionTimeControl(sess)
+			if bMs then
+				local estSec = (bMs / 1000) + 40 * ((iMs or 0) / 1000)
+				if estSec < 180 then return "bullet" end
+				if estSec < 600 then return "blitz" end
+				return "rapid"
+			end
+		end
+		local chosenTc = (CONFIG.AutoFindTc ~= "Selected") and CONFIG.AutoFindTc or (app and app.selectedTc)
+		return classFromTcString(chosenTc) or STATE.Farm.activeClass or "blitz"
+	end
+
+	function Farm.getBucket(className)
+		local root = ensureRootData()
+		local uid = tostring(LocalPlayer and LocalPlayer.UserId or 0)
+		local cls = className or STATE.Farm.activeClass or "blitz"
+		local key = uid .. ":" .. cls
+		local b = root.buckets[key]
+		if type(b) ~= "table" then
+			b = {
+				startRating = nil,
+				lastKnownRating = nil,
+				eloGainedSinceLoss = 0,
+				nextLossTargetElo = rollJitteredTarget(CONFIG.FarmLossAfterElo),
+				wins = 0,
+				losses = 0,
+				draws = 0,
+				controlledLosses = 0,
+				gamesSinceBreak = 0,
+				nextBreakAfter = math.random(5, 8),
+				netElo = 0,
+				obsK = 24,
+				lastGameId = "",
+			}
+			root.buckets[key] = b
+		else
+			if not tonumber(b.nextLossTargetElo) or b.nextLossTargetElo < 12 then
+				b.nextLossTargetElo = rollJitteredTarget(CONFIG.FarmLossAfterElo)
+			end
+			if not tonumber(b.nextBreakAfter) or b.nextBreakAfter < 3 then
+				b.nextBreakAfter = math.random(5, 8)
+			end
+			b.eloGainedSinceLoss = tonumber(b.eloGainedSinceLoss) or 0
+			b.wins = tonumber(b.wins) or 0
+			b.losses = tonumber(b.losses) or 0
+			b.draws = tonumber(b.draws) or 0
+			b.controlledLosses = tonumber(b.controlledLosses) or 0
+			b.gamesSinceBreak = tonumber(b.gamesSinceBreak) or 0
+			b.netElo = tonumber(b.netElo) or 0
+			b.obsK = tonumber(b.obsK) or 24
+			b.lastGameId = tostring(b.lastGameId or "")
+		end
+		return b
+	end
+
+	function Farm.isTournamentMatch(app, sess)
+		if app and app.Tournament and type(app.Tournament.isEntrant) == "function" then
+			local okT, isInTour = pcall(app.Tournament.isEntrant)
+			if okT and isInTour then
+				return true
+			end
+		end
+		if sess and (sess.tourId ~= nil or sess.tournament ~= nil or sess.isTournament == true) then
+			return true
+		end
+		return false
+	end
+
+	function Farm.isRatedOnline(app, sess)
+		if not sess or sess.kind ~= "online" then
+			return false
+		end
+		if Farm.isTournamentMatch(app, sess) then
+			return false
+		end
+		if sess.rated == false or sess.isRated == false or sess.casual == true or sess.friendly == true then
+			return false
+		end
+		return true
+	end
+
+	function Farm.getProfileRating(app, className)
+		if app and type(app.profile) == "table" and type(app.profile.ratings) == "table" then
+			local entry = app.profile.ratings[className]
+			if type(entry) == "table" and tonumber(entry.r) then
+				return math.floor(tonumber(entry.r) + 0.5), (entry.prov == true)
+			end
+		end
+		return nil, false
+	end
+
+	function Farm.getSessionRatings(app, sess, className)
+		local myR, oppR, oppUid, prov = nil, nil, nil, false
+		if sess and sess.myColor then
+			local mySlot = (sess.myColor == 1) and sess.white or sess.black
+			local oppSlot = (sess.myColor == 1) and sess.black or sess.white
+			if type(mySlot) == "table" then
+				myR = tonumber(mySlot.rating)
+				if mySlot.prov == true then prov = true end
+			end
+			if type(oppSlot) == "table" then
+				oppR = tonumber(oppSlot.rating)
+				oppUid = tonumber(oppSlot.userId or oppSlot.id)
+			end
+		end
+		local profR, profProv = Farm.getProfileRating(app, className)
+		if not myR then myR = profR end
+		if profProv then prov = true end
+		return myR, oppR, oppUid, prov
+	end
+
+	function Farm.estimateExpectedLoss(myRating, oppRating, bucket, isProv)
+		local eMe = 1 / (1 + (10 ^ ((oppRating - myRating) / 400)))
+		local baseK = math.clamp(tonumber(bucket and bucket.obsK) or 24, 16, 48)
+		local kCons = isProv and math.max(40, baseK * 1.25) or math.max(24, baseK * 1.15)
+		return math.ceil(kCons * eMe) + 2, eMe
+	end
+
+	function Farm.onLossTargetChanged()
+		local b = Farm.getBucket(STATE.Farm.activeClass)
+		local base = CONFIG.FarmLossAfterElo or 45
+		local lo = math.max(12, math.floor(base * 0.80))
+		local hi = math.max(lo + 2, math.ceil(base * 1.20))
+		if b.nextLossTargetElo < lo or b.nextLossTargetElo > hi then
+			b.nextLossTargetElo = rollJitteredTarget(base)
+			Farm.saveState(false)
+		end
+	end
+
+	function Farm.disarmThrow(reason)
+		local f = STATE.Farm
+		local wasArmed = f.throwArmed or f.resignPending or f.phase ~= "idle"
+		f.throwArmed = false
+		f.phase = "idle"
+		f.resignGen += 1
+		f.resignPending = false
+		f.blunderMovesPlayed = 0
+		f.lastBlunderPly = -1
+		if reason then
+			f.deferReason = reason
+		end
+		if wasArmed then
+			STATE.LastAutoKey = ""
+			STATE.AutoRetryAfter = 0
+			scheduleRecalc()
+		end
+		Farm.refreshUi(STATE.App, STATE.App and STATE.App.session)
+	end
+
+	function Farm.resetStats()
+		local cls = Farm.getSessionClass(STATE.App, STATE.App and STATE.App.session)
+		local b = Farm.getBucket(cls)
+		local curR = Farm.getProfileRating(STATE.App, cls) or b.lastKnownRating
+		b.startRating = curR
+		b.lastKnownRating = curR
+		b.eloGainedSinceLoss = 0
+		b.nextLossTargetElo = rollJitteredTarget(CONFIG.FarmLossAfterElo)
+		b.wins = 0
+		b.losses = 0
+		b.draws = 0
+		b.controlledLosses = 0
+		b.gamesSinceBreak = 0
+		b.nextBreakAfter = math.random(5, 8)
+		b.netElo = 0
+		b.lastGameId = ""
+		STATE.Farm.breakUntil = 0
+		STATE.Farm.deferReason = "Stats reset"
+		Farm.disarmThrow("Stats reset")
+		Farm.saveState(false)
+		pcall(function()
+			Library:Notify({ Title = "Farm Stats Reset", Description = "Cleared " .. cls .. " Elo cycle & record.", Time = 2.5 })
+		end)
+	end
+
+	function Farm.shouldUseThrowMove(session)
+		if not CONFIG.AutoFarm or not STATE.Farm.throwArmed then
+			return false
+		end
+		if not session or session.kind ~= "online" or session.over or not session:isMyTurn() then
+			return false
+		end
+		return STATE.Farm.phase == "blunder" or STATE.Farm.phase == "weak"
+	end
+
+	function Farm.pickThrowMove(fen, session, isCancelled)
+		local f = STATE.Farm
+		if f.phase == "weak" then
+			if math.random() < 0.55 then
+				local r = PureChess.pickHumanBlunder(fen, 90, 320, { allowMateIn1 = false })
+				if r then
+					r.engineLabel = string.format("Farm · Weak (-%dcp)", r.blunderDropCp or 0)
+					return enrichMoveInfo(fen, r)
+				end
+			else
+				local r = PureChess.search(fen, 2, 0.08, isCancelled)
+				if r then
+					r.source = "FarmBlunder"
+					r.engineLabel = "Farm · Weak (d2)"
+					r.engineKind = "farm"
+					return enrichMoveInfo(fen, r)
+				end
+			end
+		end
+		local allowM1 = (f.blunderMovesPlayed >= 4)
+		local r = PureChess.pickHumanBlunder(fen, 250, 650, { allowMateIn1 = allowM1 })
+		return r and enrichMoveInfo(fen, r) or nil
+	end
+
+	local function executeCleanResign(app, sess)
+		if not STATE.Alive or not CONFIG.AutoFarm or not STATE.Farm.throwArmed then
+			return false
+		end
+		if not app or app.session ~= sess or sess.over then
+			return true
+		end
+		if getSessionPly(sess) < 14 then
+			return false
+		end
+		if not STATE.WindowFocused then
+			return false
+		end
+		if type(app.resign) ~= "function" then
+			return false
+		end
+		local hadSettings = type(app.settings) == "table"
+		local prevConfirm = hadSettings and app.settings.confirmResign
+		if hadSettings then
+			app.settings.confirmResign = false
+		end
+		local okR = pcall(app.resign)
+		if hadSettings then
+			app.settings.confirmResign = prevConfirm
+		end
+		return okR == true
+	end
+
+	local function scheduleNaturalResign(app, sess)
+		local f = STATE.Farm
+		if f.resignPending or not f.throwArmed or sess.over then
+			return
+		end
+		f.phase = "resigning"
+		f.resignPending = true
+		f.resignGen += 1
+		local myGen = f.resignGen
+
+		-- Cancel any in-flight AutoPlay click wait so we resign instead of moving
+		STATE.AutoGen += 1
+		STATE.AutoPending = false
+
+		task.spawn(function()
+			local pauseSec = (CONFIG.FarmLossMode == "LateResign") and randTriangular(3.0, 7.0) or randTriangular(2.5, 6.0)
+			setPulseStatus("Farm · Resigning", string.format("Natural pause · %.1fs", pauseSec))
+			updateEngineBadge("Farm · Resigning...", "farm")
+
+			local endAt = os.clock() + pauseSec
+			while os.clock() < endAt do
+				if not STATE.Alive or not CONFIG.AutoFarm or not f.throwArmed or f.resignGen ~= myGen or not app or app.session ~= sess or sess.over then
+					if f.resignGen == myGen then
+						f.resignPending = false
+					end
+					return
+				end
+				task.wait(0.05)
+			end
+
+			-- Wait gently if user momentarily alt-tabbed so we don't fire while unfocused
+			local focusWaitUntil = os.clock() + 8.0
+			while not STATE.WindowFocused and os.clock() < focusWaitUntil do
+				if not STATE.Alive or not CONFIG.AutoFarm or not f.throwArmed or f.resignGen ~= myGen or app.session ~= sess or sess.over then
+					if f.resignGen == myGen then f.resignPending = false end
+					return
+				end
+				task.wait(0.10)
+			end
+
+			for attempt = 1, 2 do
+				if not STATE.Alive or not CONFIG.AutoFarm or not f.throwArmed or f.resignGen ~= myGen or app.session ~= sess or sess.over then
+					break
+				end
+				executeCleanResign(app, sess)
+				local waitOver = os.clock() + 1.8
+				while os.clock() < waitOver and not sess.over and app.session == sess and f.resignGen == myGen do
+					task.wait(0.08)
+				end
+				if sess.over or attempt == 2 then
+					break
+				end
+			end
+
+			if f.resignGen == myGen then
+				f.resignPending = false
+				if not sess.over and f.throwArmed then
+					-- Fallback back to blunder phase if resign didn't land
+					f.phase = "blunder"
+					scheduleRecalc()
+				end
+			end
+		end)
+	end
+
+	function Farm.onSessionStart(app, sess)
+		local f = STATE.Farm
+		f.gameRef = sess
+		f.gameId = tostring(sess.id or "")
+		f.gameAccounted = false
+		f.settlingGame = false
+		f.throwArmed = false
+		f.phase = "idle"
+		f.blunderMovesPlayed = 0
+		f.lastBlunderPly = -1
+		f.resignGen += 1
+		f.resignPending = false
+		f.deferReason = nil
+
+		local cls = Farm.getSessionClass(app, sess)
+		f.activeClass = cls
+		local b = Farm.getBucket(cls)
+		local myR, oppR, oppUid, prov = Farm.getSessionRatings(app, sess, cls)
+		f.preMyRating = myR
+		f.preOppRating = oppR
+		f.preProv = prov
+		if myR then
+			if not b.startRating then b.startRating = myR end
+			b.lastKnownRating = myR
+			b.netElo = b.lastKnownRating - b.startRating
+			Farm.saveState(false)
+		end
+
+		-- Evaluate all 7 Anti-Rungkat Arming Guards once at rated match start (ply <= 1)
+		local ply = getSessionPly(sess)
+		if ply > 1 then
+			return
+		end
+		if not CONFIG.AutoFarm or not CONFIG.AutoPlay then
+			return
+		end
+		if not Farm.isRatedOnline(app, sess) then
+			f.deferReason = Farm.isTournamentMatch(app, sess) and "Tournament (protected)" or "Unrated match"
+			return
+		end
+		if oppUid ~= nil and oppUid <= 0 then
+			f.deferReason = "Fallback bot (skipped)"
+			return
+		end
+		if b.eloGainedSinceLoss < b.nextLossTargetElo then
+			return
+		end
+
+		-- Guard 4: Near Target Elo Cap
+		if (CONFIG.FarmStopAtElo or 0) > 0 and myR and myR >= (CONFIG.FarmStopAtElo - 15) then
+			f.deferReason = "Near Stop Target Elo (finishing)"
+			return
+		end
+
+		-- Guard 5: Known & Comparable Opponent
+		if not myR or not oppR or myR <= 0 or oppR <= 0 then
+			f.deferReason = "Deferred: unknown ratings"
+			return
+		end
+		if oppR < (myR - 120) then
+			f.deferReason = string.format("Deferred: Opp -%d Elo (anti-rungkat)", math.floor(myR - oppR))
+			return
+		end
+
+		-- Guards 6 & 7: Expected Loss Cap & Net Keep Floor (Anti-Rungkat Guarantee!)
+		local estLoss = Farm.estimateExpectedLoss(myR, oppR, b, prov)
+		if CONFIG.FarmKeepPositive then
+			local maxAllowedLoss = math.max(10, math.floor(b.eloGainedSinceLoss * 0.40))
+			if estLoss > maxAllowedLoss then
+				f.deferReason = string.format("Deferred: Est -%d > 40%% cycle (+%d)", estLoss, b.eloGainedSinceLoss)
+				return
+			end
+			local minKeepFloor = math.max(10, math.floor((CONFIG.FarmLossAfterElo or 45) * 0.25))
+			if (b.netElo - estLoss) < minKeepFloor then
+				f.deferReason = string.format("Deferred: Net +%d - %d < floor +%d", b.netElo, estLoss, minKeepFloor)
+				return
+			end
+		end
+
+		-- All 7 guards passed -> arm controlled loss naturally!
+		f.throwArmed = true
+		f.phase = "opening"
+		local mode = CONFIG.FarmLossMode or "BlunderResign"
+		if mode == "PlayWeak" then
+			f.throwStartMove = math.random(4, 7)
+			f.maxBlunderMoves = 99
+			f.resignMinMove = 20
+		elseif mode == "LateResign" then
+			f.throwStartMove = math.random(16, 24)
+			f.maxBlunderMoves = math.random(1, 2)
+			f.resignMinMove = f.throwStartMove + 1
+		else -- BlunderResign
+			f.throwStartMove = math.random(8, 15)
+			f.maxBlunderMoves = math.random(4, 8)
+			f.resignMinMove = math.max(14, f.throwStartMove + 2)
+		end
+		f.deferReason = string.format("Armed (%s @ mv %d · est -%d)", mode, f.throwStartMove, estLoss)
+		pcall(function()
+			Library:Notify({
+				Title = "Controlled Loss Armed",
+				Description = string.format("Cycle +%d/%d Elo · %s from move %d (est -%d Elo).", b.eloGainedSinceLoss, b.nextLossTargetElo, mode, f.throwStartMove, estLoss),
+				Time = 4.0,
+			})
+		end)
+	end
+
+	function Farm.onSessionOver(app, sess)
+		local f = STATE.Farm
+		if f.gameAccounted then
+			return
+		end
+		f.gameAccounted = true
+		f.resignGen += 1
+		f.resignPending = false
+		local wasControlled = f.throwArmed == true
+		f.throwArmed = false
+		f.phase = "idle"
+
+		if not Farm.isRatedOnline(app, sess) then
+			Farm.refreshUi(app, sess)
+			return
+		end
+
+		local ply = getSessionPly(sess)
+		local resStr = tostring(sess.result or "")
+		local reasonStr = string.lower(tostring(sess.reason or ""))
+		if resStr == "*" or ply < 2 or sess.aborted == true or reasonStr == "abort" or reasonStr == "aborted" then
+			f.deferReason = "Aborted match (ignored)"
+			Farm.refreshUi(app, sess)
+			return
+		end
+
+		local cls = f.activeClass or Farm.getSessionClass(app, sess)
+		local b = Farm.getBucket(cls)
+		local curGid = tostring(sess.id or "")
+		if curGid ~= "" and b.lastGameId == curGid then
+			Farm.refreshUi(app, sess)
+			return
+		end
+
+		f.settlingGame = true
+		local preMyR = f.preMyRating or b.lastKnownRating
+		local preOppR = f.preOppRating
+		local preProv = f.preProv
+
+		task.spawn(function()
+			-- Poll up to 1.8s for server rating update to land on session slot / app.profile before queueing next match
+			local postMyR = nil
+			local dl = os.clock() + 1.8
+			while STATE.Alive and os.clock() < dl do
+				local slotR = Farm.getSessionRatings(app, sess, cls)
+				local profR = Farm.getProfileRating(app, cls)
+				if preMyR and slotR and slotR ~= preMyR then
+					postMyR = slotR
+					break
+				end
+				if preMyR and profR and profR ~= preMyR then
+					postMyR = profR
+					break
+				end
+				task.wait(0.15)
+			end
+			if not postMyR then
+				local slotR = Farm.getSessionRatings(app, sess, cls)
+				postMyR = slotR or Farm.getProfileRating(app, cls) or preMyR
+			end
+
+			local myWin = (sess.myColor == 1 and resStr == "1-0") or (sess.myColor == -1 and resStr == "0-1")
+			local myLoss = (sess.myColor == 1 and resStr == "0-1") or (sess.myColor == -1 and resStr == "1-0")
+			local myDraw = (resStr == "1/2-1/2")
+			local delta = (preMyR and postMyR) and (postMyR - preMyR) or 0
+
+			-- Update adaptive observed K-factor via EWMA when delta is non-zero
+			if preMyR and preOppR and delta ~= 0 then
+				local eMe = 1 / (1 + (10 ^ ((preOppR - preMyR) / 400)))
+				local actualS = myWin and 1 or (myDraw and 0.5 or 0)
+				local denom = math.abs(actualS - eMe)
+				if denom >= 0.12 then
+					local impliedK = math.clamp(math.abs(delta) / denom, 12, 64)
+					b.obsK = math.floor(((b.obsK or 32) * 0.70 + impliedK * 0.30) * 10 + 0.5) / 10
+				end
+			end
+
+			if postMyR then
+				if not b.startRating then b.startRating = preMyR or postMyR end
+				b.lastKnownRating = postMyR
+				b.netElo = b.lastKnownRating - b.startRating
+			else
+				b.netElo = (b.netElo or 0) + delta
+			end
+
+			if myWin then
+				b.wins += 1
+				b.eloGainedSinceLoss += math.max(0, delta)
+				f.deferReason = string.format("Won (%+d Elo)", delta)
+			elseif myLoss then
+				b.losses += 1
+				if wasControlled then
+					b.controlledLosses += 1
+					f.deferReason = string.format("Controlled Loss (%+d Elo · cycle reset)", delta)
+				else
+					f.deferReason = string.format("Natural Loss (%+d Elo · cycle reset)", delta)
+				end
+				b.eloGainedSinceLoss = 0
+				b.nextLossTargetElo = rollJitteredTarget(CONFIG.FarmLossAfterElo)
+			elseif myDraw then
+				b.draws += 1
+				b.eloGainedSinceLoss = math.max(0, b.eloGainedSinceLoss + delta)
+				f.deferReason = string.format("Draw (%+d Elo)", delta)
+			end
+
+			if curGid ~= "" then
+				b.lastGameId = curGid
+			end
+			b.gamesSinceBreak += 1
+
+			-- Periodic Human Breather (20-45s every 5-8 games)
+			if CONFIG.AutoFarm and CONFIG.FarmHumanBreather and b.gamesSinceBreak >= b.nextBreakAfter then
+				local breakSec = randTriangular(20.0, 45.0)
+				f.breakUntil = os.clock() + breakSec
+				b.gamesSinceBreak = 0
+				b.nextBreakAfter = math.random(5, 8)
+				f.deferReason = string.format("Breather (%.0fs pause)", breakSec)
+			end
+
+			-- Check Stop At Target Elo Cap
+			if CONFIG.AutoFarm and (CONFIG.FarmStopAtElo or 0) > 0 and b.lastKnownRating and b.lastKnownRating >= CONFIG.FarmStopAtElo then
+				f.deferReason = string.format("Target %d Elo Reached!", CONFIG.FarmStopAtElo)
+				if Toggles.AutoFarm then Toggles.AutoFarm:SetValue(false) end
+				if STATE.Farm.autoEnabledAutoFind and Toggles.AutoFindMatch then
+					Toggles.AutoFindMatch:SetValue(false)
+					STATE.Farm.autoEnabledAutoFind = false
+				end
+				pcall(function()
+					Library:Notify({
+						Title = "Target Elo Reached!",
+						Description = string.format("Reached %d Elo (%+d net). Auto-Farm stopped.", b.lastKnownRating, b.netElo),
+						Time = 6.0,
+					})
+				end)
+			end
+
+			-- Roll fresh inter-game queue wait (3-9s for Auto-Farm, 2.4-4.2s for standalone AutoFind)
+			f.nextQueueDelay = CONFIG.AutoFarm and randTriangular(3.0, 9.0) or randTriangular(2.4, 4.2)
+			Farm.saveState(false)
+			f.settlingGame = false
+			Farm.refreshUi(app, sess)
+		end)
+	end
+
+	function Farm.refreshUi(app, sess)
+		local f = STATE.Farm
+		local cls = Farm.getSessionClass(app, sess)
+		f.activeClass = cls
+		local b = Farm.getBucket(cls)
+		local curR = Farm.getProfileRating(app, cls) or b.lastKnownRating
+		if curR and not b.startRating then
+			b.startRating = curR
+			b.lastKnownRating = curR
+		end
+		local clsCap = string.upper(string.sub(cls, 1, 1)) .. string.sub(cls, 2)
+		local now = os.clock()
+
+		local statusTxt = "Standby"
+		if not CONFIG.AutoFarm then
+			statusTxt = "Off (" .. clsCap .. ")"
+		elseif f.settlingGame then
+			statusTxt = "Settling Rating..."
+		elseif f.breakUntil > now then
+			statusTxt = string.format("Breather (%.0fs left)", f.breakUntil - now)
+		elseif not STATE.WindowFocused then
+			statusTxt = "Paused (Unfocused)"
+		elseif f.throwArmed then
+			if f.phase == "resigning" then
+				statusTxt = "THROWING · Resigning..."
+			elseif f.phase == "blunder" then
+				statusTxt = string.format("THROWING · Blunder (%d/%d)", f.blunderMovesPlayed, f.maxBlunderMoves)
+			elseif f.phase == "weak" then
+				statusTxt = "THROWING · Weak Play"
+			else
+				statusTxt = string.format("THROW ARMED (mv %d)", f.throwStartMove)
+			end
+		elseif sess and sess.kind == "online" and not sess.over then
+			statusTxt = "Farming (" .. clsCap .. " · Normal)"
+		else
+			statusTxt = "Auto-Queueing (" .. clsCap .. ")"
+		end
+
+		setUiLabel("FarmStatusLabel", "Status: " .. statusTxt)
+		local netStr = (b.netElo >= 0) and ("+" .. tostring(b.netElo)) or tostring(b.netElo)
+		local stopStr = (CONFIG.FarmStopAtElo and CONFIG.FarmStopAtElo > 0) and (" / " .. tostring(CONFIG.FarmStopAtElo)) or ""
+		setUiLabel("FarmRatingLabel", string.format("Rating: %s%s (%s Elo)", curR and tostring(curR) or "--", stopStr, netStr))
+		setUiLabel("FarmRecordLabel", string.format("Record: %dW · %dL · %dD (%d Ctrl)", b.wins, b.losses, b.draws, b.controlledLosses))
+		setUiLabel("FarmCycleLabel", string.format("Loss Cycle: +%d / ~%d Elo", b.eloGainedSinceLoss, b.nextLossTargetElo))
+		setUiLabel("FarmGuardLabel", "Guard: " .. (f.deferReason or (CONFIG.FarmKeepPositive and "Anti-Rungkat Active" or "Off")))
+	end
+
+	function Farm.tick(app, sess, now)
+		local f = STATE.Farm
+		if not app then
+			return
+		end
+
+		-- Detect new online session start (plus lazy backfill if ratings arrived slightly after teleport)
+		if sess and sess.kind == "online" then
+			local gid = tostring(sess.id or "")
+			if f.gameRef ~= sess or (gid ~= "" and f.gameId ~= gid) then
+				Farm.onSessionStart(app, sess)
+			elseif not sess.over and getSessionPly(sess) <= 1 and (not f.preMyRating or not f.preOppRating) then
+				local cls = f.activeClass or Farm.getSessionClass(app, sess)
+				local myR, oppR = Farm.getSessionRatings(app, sess, cls)
+				if myR and oppR then
+					Farm.onSessionStart(app, sess)
+				end
+			end
+
+			if sess.over then
+				Farm.onSessionOver(app, sess)
+			elseif CONFIG.AutoFarm and f.throwArmed and sess:isMyTurn() and not f.resignPending then
+				local ply = getSessionPly(sess)
+				local fullMove = math.floor(ply / 2) + 1
+				local mode = CONFIG.FarmLossMode or "BlunderResign"
+
+				-- Phase 1 -> Phase 2 transition
+				if f.phase == "opening" and fullMove >= f.throwStartMove then
+					f.phase = (mode == "PlayWeak") and "weak" or "blunder"
+					scheduleRecalc()
+				end
+
+				-- Phase 3 Resign evaluation (strictly >= 14 plies so never an abort!)
+				if ply >= 14 and fullMove >= f.resignMinMove and (f.phase == "blunder" or f.phase == "weak") then
+					local myColor = sess.myColor or 1
+					local curRes = STATE.CurrentResult
+					local rawCp = (curRes and curRes.evalCp) or STATE.EvalWhiteCp or 0
+					local myEvalCp = rawCp * myColor
+					local mateVal = (curRes and curRes.mate) or STATE.EvalMate
+					local oppForcedMate = (mateVal ~= nil and (mateVal * myColor) < 0)
+					local oppImmediateMate = oppForcedMate and math.abs(mateVal) <= 2
+
+					local shouldResign = false
+					if not oppImmediateMate then
+						if mode == "BlunderResign" then
+							shouldResign = (myEvalCp <= -450)
+								or oppForcedMate
+								or (f.blunderMovesPlayed >= f.maxBlunderMoves and myEvalCp <= -200)
+								or (f.blunderMovesPlayed >= (f.maxBlunderMoves + 3))
+						elseif mode == "LateResign" then
+							shouldResign = (f.blunderMovesPlayed >= 1 and myEvalCp <= -320)
+								or (f.blunderMovesPlayed >= 2)
+						elseif mode == "PlayWeak" then
+							shouldResign = (fullMove >= 20) and (myEvalCp <= -850 or oppForcedMate)
+						end
+					end
+
+					if shouldResign then
+						scheduleNaturalResign(app, sess)
+					end
+				end
+			end
+		elseif f.throwArmed then
+			Farm.disarmThrow()
+		end
+
+		if now - f.lastUiUpdate >= 0.40 then
+			f.lastUiUpdate = now
+			Farm.refreshUi(app, sess)
+		end
+	end
+end
+
 local function tickAutoFindMatch(app, sess, now)
-	if not CONFIG.AutoFindMatch or not app or not app.profile then
+	if (not CONFIG.AutoFindMatch and not CONFIG.AutoFarm) or not app or not app.profile then
+		STATE.Farm.idleSince = 0
 		return
 	end
 	if app.searching or app.joining then
@@ -4649,28 +5937,59 @@ local function tickAutoFindMatch(app, sess, now)
 	end
 	if type(app.inLiveGame) == "function" and app.inLiveGame() then
 		STATE.AutoFindOverAt = 0
+		STATE.Farm.idleSince = 0
 		return
 	end
 	-- Do not interfere while enrolled in a running Tournament bracket
-	if app.Tournament and type(app.Tournament.isEntrant) == "function" then
-		local okT, isInTour = pcall(app.Tournament.isEntrant)
-		if okT and isInTour then
+	if Farm.isTournamentMatch and Farm.isTournamentMatch(app, sess) then
+		return
+	end
+	-- v2.1.0 Fix #4: Pause queueing while window is unfocused if AutoPlay/AutoFarm is active (prevents AFK timeouts & bl=1)
+	if (CONFIG.AutoPlay or CONFIG.AutoFarm) and not STATE.WindowFocused then
+		return
+	end
+	-- Wait for post-game Elo delta settle & periodic human breather
+	if STATE.Farm.settlingGame then
+		return
+	end
+	if CONFIG.AutoFarm and STATE.Farm.breakUntil > now then
+		setPulseStatus("Farm · Breather", string.format("Next queue in %.0fs", STATE.Farm.breakUntil - now))
+		return
+	end
+	-- Check Target Elo Cap before queueing
+	if CONFIG.AutoFarm and (CONFIG.FarmStopAtElo or 0) > 0 then
+		local cls = Farm.getSessionClass(app, sess)
+		local curR = Farm.getProfileRating(app, cls)
+		if curR and curR >= CONFIG.FarmStopAtElo then
+			if Toggles.AutoFarm then Toggles.AutoFarm:SetValue(false) end
 			return
 		end
 	end
 
 	local canQueue = false
 	if not sess or sess.kind == "idle" then
-		canQueue = true
+		-- Enforce settle delay on idle so startup / post-teleport doesn't fire on frame 1
+		if STATE.Farm.idleSince == 0 then
+			STATE.Farm.idleSince = now
+		end
+		local idleNeed = CONFIG.AutoFarm and 2.2 or 1.8
+		if (now - STATE.Farm.idleSince) >= idleNeed then
+			canQueue = true
+		end
 	elseif sess.kind == "online" and sess.over then
+		STATE.Farm.idleSince = 0
 		if STATE.AutoFindOverAt == 0 then
 			STATE.AutoFindOverAt = now
+			if STATE.Farm.nextQueueDelay <= 0 then
+				STATE.Farm.nextQueueDelay = CONFIG.AutoFarm and randTriangular(3.0, 9.0) or randTriangular(2.4, 4.2)
+			end
 		end
-		if now - STATE.AutoFindOverAt >= 2.4 then
+		if (now - STATE.AutoFindOverAt) >= math.max(2.0, STATE.Farm.nextQueueDelay or 3.0) then
 			canQueue = true
 		end
 	else
 		STATE.AutoFindOverAt = 0
+		STATE.Farm.idleSince = 0
 	end
 
 	if canQueue and (now - STATE.AutoFindLastQueueAt >= 5.0) and type(app.startSearch) == "function" then
@@ -4680,6 +5999,8 @@ local function tickAutoFindMatch(app, sess, now)
 		end
 		STATE.AutoFindLastQueueAt = now
 		STATE.AutoFindOverAt = 0
+		STATE.Farm.idleSince = 0
+		STATE.Farm.nextQueueDelay = 0
 		if app.modals and type(app.modals.closeAll) == "function" then
 			pcall(app.modals.closeAll)
 		end
@@ -4710,7 +6031,9 @@ local function updateHudReadout(sess, res, thinking)
 	setUiLabel("OpponentLabel", formatOpponentLabel(sess))
 
 	local turboTag = ""
-	if CONFIG.AntiEngineTurbo and sess.kind == "online" then
+	if CONFIG.AutoFarm and STATE.Farm.throwArmed and sess.kind == "online" then
+		turboTag = (STATE.Farm.phase == "resigning") and " [RESIGN]" or " [FARM]"
+	elseif CONFIG.AntiEngineTurbo and sess.kind == "online" then
 		if STATE.Opp.turboActive then
 			turboTag = " [TURBO]"
 		elseif STATE.Opp.suspect then
@@ -4741,6 +6064,8 @@ local function updateHudReadout(sess, res, thinking)
 		local evStr = formatEvalText(res.evalCp, res.mate)
 		setUiLabel("EvalLabel", "Eval: " .. evStr)
 		setUiLabel("LineLabel", "Line: " .. table.concat(res.pv or { res.best }, "  "))
+		STATE.EvalWhiteCp = res.evalCp or 0
+		STATE.EvalMate = res.mate
 		updateEvalBarVisual(res.evalCp, res.mate, STATE.Board and STATE.Board.flipped == true)
 		setPulseStatus(engName .. turboTag, (res.san or res.best) .. " (" .. evStr .. ")" .. depthTag)
 		updateEngineBadge(engName .. depthTag .. msTag .. turboTag, engKind)
@@ -4827,6 +6152,8 @@ triggerRecalc = function(force)
 		CONFIG.EngineMode,
 		CONFIG.PlayStyle,
 		tostring(CONFIG.AutoAdapt),
+		tostring(CONFIG.AutoFarm),
+		tostring(STATE.Farm.phase),
 		tostring(CONFIG.StockfishDepth),
 		tostring(CONFIG.LuauMaxDepth),
 		tostring(CONFIG.OnlyMyTurn),
@@ -4836,8 +6163,11 @@ triggerRecalc = function(force)
 		return
 	end
 	if force then
+		-- v2.1.0 Fix #1: clear LastAutoKey & AutoRetryAfter so forced recalc never deadlocks AutoPlay
 		STATE.AutoGen += 1
 		STATE.AutoPending = false
+		STATE.LastAutoKey = ""
+		STATE.AutoRetryAfter = 0
 	end
 	STATE.LastKey = key
 	STATE.SearchGen += 1
@@ -4846,11 +6176,13 @@ triggerRecalc = function(force)
 	STATE.LastArrowSig = ""
 	STATE.MissingResultSince = 0
 
-	if sess.over or not CONFIG.Enabled then
+	if sess.over or not CONFIG.Enabled or STATE.Farm.resignPending or STATE.Farm.phase == "resigning" then
 		STATE.Searching = false
 		STATE.ActiveStage = nil
 		STATE.TerminalKey = ""
-		updateHudReadout(sess, nil, false)
+		if not STATE.Farm.resignPending and STATE.Farm.phase ~= "resigning" then
+			updateHudReadout(sess, nil, false)
+		end
 		return
 	end
 
@@ -4908,6 +6240,11 @@ triggerRecalc = function(force)
 				res.evalSwing = (STATE.LastEvalCp ~= nil and rawTopCp ~= nil) and math.abs(rawTopCp - STATE.LastEvalCp) or 0
 				STATE.LastEvalCp = rawTopCp
 				STATE.LastMyTurnResult = res
+
+				if res.source == "FarmBlunder" and STATE.Farm.throwArmed and STATE.Farm.lastBlunderPly ~= plyCount then
+					STATE.Farm.lastBlunderPly = plyCount
+					STATE.Farm.blunderMovesPlayed += 1
+				end
 
 				local isSfSrc = isStockfishSource(res.source)
 
@@ -5037,21 +6374,25 @@ local function tickWatchdogs(app, sess, now)
 	end
 end
 
--- Cross-Server Teleport Persistence (re-queues BeverlyHub automatically when RoChess teleports into a match)
+-- Cross-Server Teleport Persistence (re-queues BeverlyHub & flushes Farm state on RoChess match teleports)
 if LocalPlayer and LocalPlayer.OnTeleport then
 	trackConn(LocalPlayer.OnTeleport:Connect(function(tpState)
-		if not STATE.Alive or not CONFIG.AutoReloadOnTeleport then
+		if not STATE.Alive then
 			return
 		end
 		if tpState == Enum.TeleportState.Failed then
 			STATE.TeleportQueued = false
 			return
 		end
-		if STATE.TeleportQueued then
-			return
-		end
-		if tpState == Enum.TeleportState.Started or tpState == Enum.TeleportState.InProgress then
-			if type(queueOnTeleport) == "function" then
+		-- v2.1.0 Fix #3: handle RequestedFromServer (server-initiated TeleportAsync) + Started/InProgress
+		if tpState == Enum.TeleportState.RequestedFromServer
+			or tpState == Enum.TeleportState.Started
+			or tpState == Enum.TeleportState.InProgress
+		then
+			if Farm.saveState then
+				Farm.saveState(true)
+			end
+			if CONFIG.AutoReloadOnTeleport and not STATE.TeleportQueued and type(queueOnTeleport) == "function" then
 				STATE.TeleportQueued = true
 				local okQ = pcall(queueOnTeleport, getTeleportLoaderSource())
 				if not okQ then
@@ -5070,6 +6411,10 @@ cleanup = function()
 	STATE.Alive = false
 	STATE.SearchGen += 1
 	STATE.AutoGen += 1
+	STATE.Farm.resignGen += 1
+	if Farm.saveState then
+		Farm.saveState(false)
+	end
 	cancelPrefetchState()
 	for _, conn in ipairs(STATE.Connections) do
 		pcall(function() conn:Disconnect() end)
@@ -5094,6 +6439,8 @@ Library:OnUnload(cleanup)
 task.spawn(function()
 	-- Yield 1 frame so SaveManager autoload deferred callbacks settle before initial recalc
 	task.wait()
+	if Farm.loadState then Farm.loadState() end
+	if Farm.applyTeleportResume then Farm.applyTeleportResume() end
 	syncConfigFromUI()
 
 	local tries = 0
@@ -5109,6 +6456,7 @@ task.spawn(function()
 	end
 
 	STATE.Board = STATE.App.board
+	if Farm.refreshUi then Farm.refreshUi(STATE.App, STATE.App.session) end
 	updateHudReadout(STATE.App.session, nil, false)
 	triggerRecalc(true)
 
@@ -5134,14 +6482,16 @@ task.spawn(function()
 			lastFramePly = curPly
 			lastFrameTurn = curTurn
 			updateOpponentDetector(sess)
+			if Farm.tick then Farm.tick(app, sess, now) end
 			triggerRecalc(false)
 		end
 
-		-- Periodic watchdogs & clock checks at 0.10s
+		-- Periodic watchdogs, Auto-Farm Elo & clock checks at 0.10s
 		if now - lastCheck >= 0.10 then
 			lastCheck = now
 			if not plyChanged then
 				updateOpponentDetector(sess)
+				if Farm.tick then Farm.tick(app, sess, now) end
 				triggerRecalc(false)
 			end
 			tickWatchdogs(app, sess, now)
