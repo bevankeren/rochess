@@ -31,7 +31,7 @@ end
 
 local LIB_BASE = "https://raw.githubusercontent.com/bevankeren/BeverlyLIB/main/"
 local REMOTE_SCRIPT_URL = "https://raw.githubusercontent.com/bevankeren/rochess/main/rochess.lua"
-local HUB_VERSION = "2.1.0"
+local HUB_VERSION = "2.2.0"
 
 -- ============================================================================
 -- 1. CONFIGURATION & RUNTIME STATE
@@ -52,6 +52,7 @@ local CONFIG = {
 	ShowHighlights = true,
 	ShowEvalBar = true,
 	ShowEngineBadge = true,
+	DynamicModeColors = true, -- Automatically color arrows & highlights by active engine/mode
 	ArrowColor = Color3.fromRGB(56, 217, 169),
 	OnlyMyTurn = true,
 	PuzzleHelper = true,
@@ -3038,60 +3039,273 @@ do
 	st.Parent = promoBadge
 end
 
--- Compact On-Board Active Engine Pill (always visible even when menu is hidden)
-local engineBadge = Instance.new("Frame")
-engineBadge.Name = "EngineBadge"
-engineBadge.AnchorPoint = Vector2.new(0.5, 0)
-engineBadge.Position = UDim2.new(0.5, 0, 0, 6)
-engineBadge.Size = UDim2.fromOffset(0, 22)
-engineBadge.AutomaticSize = Enum.AutomaticSize.X
-engineBadge.BackgroundColor3 = Color3.fromRGB(13, 14, 18)
-engineBadge.BackgroundTransparency = 0.14
-engineBadge.BorderSizePixel = 0
-engineBadge.Visible = false
-engineBadge.Parent = badgeLayer
-do
-	local c = Instance.new("UICorner")
-	c.CornerRadius = UDim.new(0, 5)
-	c.Parent = engineBadge
-	local st = Instance.new("UIStroke")
-	st.Color = Color3.fromRGB(48, 54, 68)
-	st.Thickness = 1
-	st.Parent = engineBadge
-	local pad = Instance.new("UIPadding")
-	pad.PaddingLeft = UDim.new(0, 8)
-	pad.PaddingRight = UDim.new(0, 9)
-	pad.Parent = engineBadge
-	local list = Instance.new("UIListLayout")
-	list.FillDirection = Enum.FillDirection.Horizontal
-	list.VerticalAlignment = Enum.VerticalAlignment.Center
-	list.Padding = UDim.new(0, 6)
-	list.SortOrder = Enum.SortOrder.LayoutOrder
-	list.Parent = engineBadge
-end
+-- Mode / Engine Color Palette (shared by Board Arrows, Highlights, and Draggable Tactical HUD)
+local BADGE_COLORS = {
+	vpssf = Color3.fromRGB(52, 211, 255),
+	gm = Color3.fromRGB(72, 224, 168),
+	farm = Color3.fromRGB(245, 138, 86),
+	stockfish = Color3.fromRGB(56, 217, 169),
+	turbo = Color3.fromRGB(240, 86, 86),
+	suspect = Color3.fromRGB(255, 154, 74),
+	localws = Color3.fromRGB(96, 185, 255),
+	luau = Color3.fromRGB(168, 130, 255),
+	fallback = Color3.fromRGB(235, 168, 76),
+	book = Color3.fromRGB(120, 210, 150),
+	puzzle = Color3.fromRGB(245, 196, 81),
+	mate = Color3.fromRGB(245, 196, 81),
+	thinking = Color3.fromRGB(245, 196, 81),
+	idle = Color3.fromRGB(110, 118, 138),
+}
 
-local engineBadgeDot = Instance.new("Frame")
-engineBadgeDot.LayoutOrder = 1
-engineBadgeDot.Size = UDim2.fromOffset(6, 6)
-engineBadgeDot.BackgroundColor3 = Color3.fromRGB(56, 217, 169)
-engineBadgeDot.BorderSizePixel = 0
-engineBadgeDot.Parent = engineBadge
+-- Upgraded Draggable Interactive Tactical Status HUD (direct child of overlayGui, zero touch on ChessUI)
+local HUD = {
+	root = nil,
+	stroke = nil,
+	accentBar = nil,
+	dot = nil,
+	title = nil,
+	evalPill = nil,
+	evalText = nil,
+	fyiPill = nil,
+	fyiTag = nil,
+	fyiText = nil,
+	dragging = false,
+	customPos = false,
+	tempHiddenForClick = false,
+	lastClickAt = 0,
+	lastKind = "idle",
+}
 do
-	local c = Instance.new("UICorner")
-	c.CornerRadius = UDim.new(1, 0)
-	c.Parent = engineBadgeDot
-end
+	local card = Instance.new("Frame")
+	card.Name = "TacticalHudCard"
+	card.AnchorPoint = Vector2.new(0.5, 0)
+	card.Position = UDim2.new(0.5, 0, 0, 10)
+	card.Size = UDim2.fromOffset(396, 62)
+	card.BackgroundColor3 = Color3.fromRGB(14, 16, 22)
+	card.BackgroundTransparency = 0.06
+	card.BorderSizePixel = 0
+	card.Active = true
+	card.ClipsDescendants = true
+	card.ZIndex = 12
+	card.Visible = false
+	card.Parent = overlayGui
+	HUD.root = card
 
-local engineBadgeText = Instance.new("TextLabel")
-engineBadgeText.LayoutOrder = 2
-engineBadgeText.BackgroundTransparency = 1
-engineBadgeText.Size = UDim2.fromScale(0, 1)
-engineBadgeText.AutomaticSize = Enum.AutomaticSize.X
-engineBadgeText.Font = Enum.Font.RobotoMono
-engineBadgeText.TextSize = 11
-engineBadgeText.TextColor3 = Color3.fromRGB(232, 236, 244)
-engineBadgeText.Text = "Stockfish Cloud"
-engineBadgeText.Parent = engineBadge
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 11)
+	corner.Parent = card
+
+	local grad = Instance.new("UIGradient")
+	grad.Rotation = 90
+	grad.Color = ColorSequence.new({
+		ColorSequenceKeypoint.new(0, Color3.fromRGB(24, 28, 39)),
+		ColorSequenceKeypoint.new(1, Color3.fromRGB(13, 15, 21)),
+	})
+	grad.Parent = card
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(56, 217, 169)
+	stroke.Thickness = 1.4
+	stroke.Transparency = 0.42
+	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	stroke.Parent = card
+	HUD.stroke = stroke
+
+	-- Left vertical glowing mode accent bar
+	local accentBar = Instance.new("Frame")
+	accentBar.Name = "AccentBar"
+	accentBar.Position = UDim2.fromOffset(0, 8)
+	accentBar.Size = UDim2.new(0, 4, 1, -16)
+	accentBar.BackgroundColor3 = Color3.fromRGB(56, 217, 169)
+	accentBar.BorderSizePixel = 0
+	accentBar.ZIndex = 13
+	accentBar.Parent = card
+	local abCorner = Instance.new("UICorner")
+	abCorner.CornerRadius = UDim.new(0, 3)
+	abCorner.Parent = accentBar
+	HUD.accentBar = accentBar
+
+	-- Top row: Grip + Live Dot + Engine Status + Eval Pill
+	local grip = Instance.new("TextLabel")
+	grip.Name = "Grip"
+	grip.BackgroundTransparency = 1
+	grip.Position = UDim2.fromOffset(10, 7)
+	grip.Size = UDim2.fromOffset(14, 20)
+	grip.Font = Enum.Font.GothamBold
+	grip.TextSize = 13
+	grip.TextColor3 = Color3.fromRGB(98, 108, 130)
+	grip.Text = "⋮⋮"
+	grip.ZIndex = 13
+	grip.Parent = card
+
+	local dot = Instance.new("Frame")
+	dot.Name = "PulseDot"
+	dot.AnchorPoint = Vector2.new(0.5, 0.5)
+	dot.Position = UDim2.fromOffset(31, 17)
+	dot.Size = UDim2.fromOffset(9, 9)
+	dot.BackgroundColor3 = Color3.fromRGB(56, 217, 169)
+	dot.BorderSizePixel = 0
+	dot.ZIndex = 13
+	dot.Parent = card
+	local dotCorner = Instance.new("UICorner")
+	dotCorner.CornerRadius = UDim.new(1, 0)
+	dotCorner.Parent = dot
+	HUD.dot = dot
+
+	local title = Instance.new("TextLabel")
+	title.Name = "EngineTitle"
+	title.BackgroundTransparency = 1
+	title.Position = UDim2.fromOffset(42, 6)
+	title.Size = UDim2.new(1, -112, 0, 22)
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 13
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.TextTruncate = Enum.TextTruncate.AtEnd
+	title.TextColor3 = Color3.fromRGB(238, 242, 250)
+	title.Text = "Stockfish 19 VPS · Ready"
+	title.ZIndex = 13
+	title.Parent = card
+	HUD.title = title
+
+	local evalPill = Instance.new("Frame")
+	evalPill.Name = "EvalPill"
+	evalPill.AnchorPoint = Vector2.new(1, 0)
+	evalPill.Position = UDim2.new(1, -9, 0, 7)
+	evalPill.Size = UDim2.fromOffset(56, 20)
+	evalPill.BackgroundColor3 = Color3.fromRGB(30, 36, 48)
+	evalPill.BorderSizePixel = 0
+	evalPill.ZIndex = 13
+	evalPill.Parent = card
+	local epCorner = Instance.new("UICorner")
+	epCorner.CornerRadius = UDim.new(0, 6)
+	epCorner.Parent = evalPill
+	HUD.evalPill = evalPill
+
+	local evalText = Instance.new("TextLabel")
+	evalText.Name = "EvalText"
+	evalText.BackgroundTransparency = 1
+	evalText.Size = UDim2.fromScale(1, 1)
+	evalText.Font = Enum.Font.RobotoMono
+	evalText.TextSize = 11
+	evalText.TextColor3 = Color3.fromRGB(230, 236, 248)
+	evalText.Text = "0.00"
+	evalText.ZIndex = 14
+	evalText.Parent = evalPill
+	HUD.evalText = evalText
+
+	-- Subtle separator line
+	local sep = Instance.new("Frame")
+	sep.Name = "Divider"
+	sep.Position = UDim2.fromOffset(12, 32)
+	sep.Size = UDim2.new(1, -22, 0, 1)
+	sep.BackgroundColor3 = Color3.fromRGB(52, 60, 78)
+	sep.BackgroundTransparency = 0.50
+	sep.BorderSizePixel = 0
+	sep.ZIndex = 13
+	sep.Parent = card
+
+	-- Bottom row: Interactive FYI Tag Pill + Live Commentary
+	local fyiPill = Instance.new("Frame")
+	fyiPill.Name = "FyiPill"
+	fyiPill.Position = UDim2.fromOffset(12, 38)
+	fyiPill.Size = UDim2.fromOffset(58, 17)
+	fyiPill.BackgroundColor3 = Color3.fromRGB(56, 217, 169)
+	fyiPill.BackgroundTransparency = 0.80
+	fyiPill.BorderSizePixel = 0
+	fyiPill.ZIndex = 13
+	fyiPill.Parent = card
+	local fpCorner = Instance.new("UICorner")
+	fpCorner.CornerRadius = UDim.new(0, 5)
+	fpCorner.Parent = fyiPill
+	local fpStroke = Instance.new("UIStroke")
+	fpStroke.Color = Color3.fromRGB(56, 217, 169)
+	fpStroke.Thickness = 1
+	fpStroke.Transparency = 0.45
+	fpStroke.Parent = fyiPill
+	HUD.fyiPill = fyiPill
+	HUD.fyiStroke = fpStroke
+
+	local fyiTag = Instance.new("TextLabel")
+	fyiTag.Name = "FyiTag"
+	fyiTag.BackgroundTransparency = 1
+	fyiTag.Size = UDim2.fromScale(1, 1)
+	fyiTag.Font = Enum.Font.GothamBold
+	fyiTag.TextSize = 10
+	fyiTag.TextColor3 = Color3.fromRGB(92, 235, 190)
+	fyiTag.Text = "READY"
+	fyiTag.ZIndex = 14
+	fyiTag.Parent = fyiPill
+	HUD.fyiTag = fyiTag
+
+	local fyiText = Instance.new("TextLabel")
+	fyiText.Name = "FyiText"
+	fyiText.BackgroundTransparency = 1
+	fyiText.Position = UDim2.fromOffset(76, 37)
+	fyiText.Size = UDim2.new(1, -86, 0, 19)
+	fyiText.Font = Enum.Font.GothamMedium
+	fyiText.TextSize = 12
+	fyiText.TextXAlignment = Enum.TextXAlignment.Left
+	fyiText.TextTruncate = Enum.TextTruncate.AtEnd
+	fyiText.TextColor3 = Color3.fromRGB(205, 214, 232)
+	fyiText.Text = "Siap main! Drag kartu ini ke mana aja (double-click reset)"
+	fyiText.ZIndex = 13
+	fyiText.Parent = card
+	HUD.fyiText = fyiText
+
+	-- Smooth drag + double-click reset (clamped inside screen bounds)
+	local dragStartMouse = nil
+	local dragStartPos = nil
+	local movedDuringDrag = false
+
+	trackConn(card.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			local now = os.clock()
+			if (now - HUD.lastClickAt) <= 0.32 and not movedDuringDrag then
+				-- Double-click snaps cleanly back to top-center
+				HUD.customPos = false
+				card.AnchorPoint = Vector2.new(0.5, 0)
+				card.Position = UDim2.new(0.5, 0, 0, 10)
+				HUD.lastClickAt = 0
+				return
+			end
+			HUD.lastClickAt = now
+			HUD.dragging = true
+			movedDuringDrag = false
+			dragStartMouse = Vector2.new(input.Position.X, input.Position.Y)
+			local absPos = card.AbsolutePosition
+			card.AnchorPoint = Vector2.new(0, 0)
+			card.Position = UDim2.fromOffset(absPos.X, absPos.Y)
+			dragStartPos = absPos
+		end
+	end))
+
+	trackConn(UserInputService.InputChanged:Connect(function(input)
+		if not HUD.dragging or not dragStartMouse or not dragStartPos then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			local delta = Vector2.new(input.Position.X, input.Position.Y) - dragStartMouse
+			if delta.Magnitude >= 4 then
+				movedDuringDrag = true
+				HUD.customPos = true
+			end
+			local cam = workspace.CurrentCamera
+			local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+			local inset = GuiService:GetGuiInset()
+			local maxX = math.max(8, vp.X - card.AbsoluteSize.X - 8)
+			local maxY = math.max(8, vp.Y - inset.Y - card.AbsoluteSize.Y - 8)
+			local nx = math.clamp(dragStartPos.X + delta.X, 8, maxX)
+			local ny = math.clamp(dragStartPos.Y + delta.Y, 6, maxY)
+			card.Position = UDim2.fromOffset(nx, ny)
+		end
+	end))
+
+	trackConn(UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			HUD.dragging = false
+		end
+	end))
+end
 
 -- Vertical Eval Bar docked left of board
 local evalBarFrame = Instance.new("Frame")
@@ -3437,6 +3651,7 @@ local function syncConfigFromUI()
 		CONFIG.ShowHighlights = hasLayer(layers, "Square Highlights")
 		CONFIG.ShowEvalBar = hasLayer(layers, "Eval Bar")
 		CONFIG.ShowEngineBadge = hasLayer(layers, "Engine Badge")
+		CONFIG.DynamicModeColors = hasLayer(layers, "Dynamic Mode Colors")
 	end
 	if Options.ArrowColor and typeof(Options.ArrowColor.Value) == "Color3" then
 		CONFIG.ArrowColor = Options.ArrowColor.Value
@@ -3523,9 +3738,9 @@ AssistBox:AddToggle("BoardAssist", {
 AssistBox:AddDropdown("VisualLayers", {
 	Text = "Visuals",
 	Multi = true,
-	Values = { "Best Move Arrow", "Opponent Ponder", "Square Highlights", "Eval Bar", "Engine Badge" },
-	Default = { "Best Move Arrow", "Opponent Ponder", "Square Highlights", "Eval Bar", "Engine Badge" },
-	Tooltip = "Select which visual guides appear over the board.",
+	Values = { "Best Move Arrow", "Opponent Ponder", "Square Highlights", "Eval Bar", "Engine Badge", "Dynamic Mode Colors" },
+	Default = { "Best Move Arrow", "Opponent Ponder", "Square Highlights", "Eval Bar", "Engine Badge", "Dynamic Mode Colors" },
+	Tooltip = "Select which visual guides appear over the board. Dynamic Mode Colors tints arrows & highlights per active engine/mode.",
 })
 
 AssistBox:AddDropdown("EngineMode", {
@@ -4068,6 +4283,9 @@ local function isSafeToSendInput()
 	if not STATE.WindowFocused then
 		return false, "Focus"
 	end
+	if HUD.dragging then
+		return false, "Dragging HUD"
+	end
 	if UserInputService:GetFocusedTextBox() ~= nil then
 		return false, "Typing"
 	end
@@ -4075,6 +4293,17 @@ local function isSafeToSendInput()
 		return false, "Mouse Held"
 	end
 	return true, nil
+end
+
+local function isPointOverBadge(vpPoint, inset)
+	local card = HUD.root
+	if not card or not card.Visible then
+		return false
+	end
+	local pos = card.AbsolutePosition + inset
+	local sz = card.AbsoluteSize
+	return vpPoint.X >= (pos.X - 6) and vpPoint.X <= (pos.X + sz.X + 6)
+		and vpPoint.Y >= (pos.Y - 6) and vpPoint.Y <= (pos.Y + sz.Y + 6)
 end
 
 local function isPointOverMenu(vpPoint, inset)
@@ -4504,12 +4733,20 @@ performSafeAutoMove = function(session, res, expectedKey)
 				pFrom = f.AbsolutePosition + inset + sqCenterLocal(res.fromSq, curBoard.flipped, sqPx)
 			end
 
+			-- If user dragged the Tactical HUD directly over pFrom/pTo, hide it for the click instant
+			if (isPointOverBadge(pFrom, inset) or isPointOverBadge(pTo, inset)) and HUD.root then
+				HUD.tempHiddenForClick = true
+				HUD.root.Visible = false
+				pcall(function() RunService.RenderStepped:Wait() end)
+			end
+
 			local okFrom = sendSafeClick(
 				pFrom.X + (math.random() * 2 - 1) * jitter,
 				pFrom.Y + (math.random() * 2 - 1) * jitter,
 				fastClick
 			)
 			if not okFrom then
+				HUD.tempHiddenForClick = false
 				task.wait(0.08)
 				continue
 			end
@@ -4530,10 +4767,12 @@ performSafeAutoMove = function(session, res, expectedKey)
 			task.wait(clickPause)
 
 			if isStaleAuto() or curApp.session ~= session or session.over or getSessionPly(session) ~= targetPly or not session:isMyTurn() then
+				HUD.tempHiddenForClick = false
 				moveRegistered = true
 				break
 			end
 			if not isSafeToSendInput() then
+				HUD.tempHiddenForClick = false
 				if type(curBoard.deselect) == "function" then
 					pcall(function() curBoard:deselect() end)
 				end
@@ -4543,6 +4782,7 @@ performSafeAutoMove = function(session, res, expectedKey)
 			if type(curApp.fullPage) == "function" then
 				local okFull2, isFull2 = pcall(curApp.fullPage)
 				if okFull2 and isFull2 then
+					HUD.tempHiddenForClick = false
 					if type(curBoard.deselect) == "function" then
 						pcall(function() curBoard:deselect() end)
 					end
@@ -4553,6 +4793,7 @@ performSafeAutoMove = function(session, res, expectedKey)
 			-- Recompute fresh pTo + inset after clickPause (guards against resize/reposition)
 			local f2 = curApp.board and curApp.board.frame
 			if not f2 or not f2.Visible or f2.AbsoluteSize.X < 80 then
+				HUD.tempHiddenForClick = false
 				continue
 			end
 			local inset2 = GuiService:GetGuiInset()
@@ -4560,12 +4801,18 @@ performSafeAutoMove = function(session, res, expectedKey)
 			local jitter2 = sqPx2 * 0.11
 			pTo = f2.AbsolutePosition + inset2 + sqCenterLocal(res.toSq, curApp.board.flipped, sqPx2)
 			ensureBoardUnoccluded(pTo, pTo, inset2)
+			if not HUD.tempHiddenForClick and isPointOverBadge(pTo, inset2) and HUD.root then
+				HUD.tempHiddenForClick = true
+				HUD.root.Visible = false
+				pcall(function() RunService.RenderStepped:Wait() end)
+			end
 
 			local okTo = sendSafeClick(
 				pTo.X + (math.random() * 2 - 1) * jitter2,
 				pTo.Y + (math.random() * 2 - 1) * jitter2,
 				fastClick
 			)
+			HUD.tempHiddenForClick = false
 			if not okTo then
 				task.wait(0.08)
 				continue
@@ -4632,6 +4879,7 @@ performSafeAutoMove = function(session, res, expectedKey)
 			STATE.AutoRetryAfter = os.clock() + 0.55
 		end
 		if STATE.AutoGen == myAutoGen then
+			HUD.tempHiddenForClick = false
 			STATE.AutoPending = false
 		end
 	end)
@@ -4673,11 +4921,50 @@ local function isBoardRenderable()
 	return true
 end
 
+local function resolveMoveAccentColor(sess, res)
+	if res and res.mate and res.mate ~= 0 then
+		return BADGE_COLORS.mate
+	end
+	if not CONFIG.DynamicModeColors then
+		return CONFIG.ArrowColor or THEME.Accent
+	end
+	if res and res.source == "FarmBlunder" then
+		return BADGE_COLORS.farm
+	end
+	if CONFIG.AutoFarm and STATE.Farm.throwArmed and STATE.Farm.phase ~= "opening" and STATE.Farm.phase ~= "idle" then
+		return BADGE_COLORS.farm
+	end
+	if CONFIG.AntiEngineTurbo and sess and sess.kind == "online" then
+		if STATE.Opp.turboActive then
+			return BADGE_COLORS.turbo
+		elseif STATE.Opp.suspect then
+			return BADGE_COLORS.suspect
+		end
+	end
+	local k = res and res.engineKind
+	if k and BADGE_COLORS[k] then
+		return BADGE_COLORS[k]
+	end
+	return CONFIG.ArrowColor or THEME.Accent
+end
+
 local function renderOverlay()
 	local app = STATE.App
 	local board = app and app.board
 	local sess = app and app.session
 	local show = CONFIG.Enabled and isBoardRenderable() and board and board.frame and board.frame.AbsoluteSize.X > 40
+
+	-- Draggable Tactical Status HUD visibility + subtle pulse dot animation
+	if HUD.root then
+		local showHud = CONFIG.Enabled and CONFIG.ShowEngineBadge and (not HUD.tempHiddenForClick)
+			and (show or (CONFIG.AutoFarm and app ~= nil and app.profile ~= nil))
+		HUD.root.Visible = showHud
+		if showHud and HUD.dot then
+			local pulseSpeed = (HUD.lastKind == "thinking" or HUD.lastKind == "turbo") and 7.5 or 2.8
+			local alpha = 0.08 + 0.34 * (0.5 + 0.5 * math.sin(os.clock() * pulseSpeed))
+			HUD.dot.BackgroundTransparency = (HUD.lastKind == "idle") and 0.35 or alpha
+		end
+	end
 
 	if not show then
 		boardProxy.Visible = false
@@ -4711,13 +4998,6 @@ local function renderOverlay()
 		evalBarFrame.Visible = false
 	end
 
-	-- Active Engine Badge on top-right corner of board (visible even when BeverlyHub menu is hidden)
-	if CONFIG.ShowEngineBadge and not sess.over then
-		engineBadge.Visible = true
-	else
-		engineBadge.Visible = false
-	end
-
 	local res = STATE.CurrentResult
 	local validForTurn = res ~= nil
 		and (not sess.over)
@@ -4731,8 +5011,8 @@ local function renderOverlay()
 		return
 	end
 
-	-- Highlights (controlled by Visuals multi-dropdown & custom arrow color)
-	local accentColor = (res.mate and res.mate ~= 0) and THEME.Gold or (CONFIG.ArrowColor or THEME.Accent)
+	-- Dynamic per-engine/mode highlight & arrow color (or custom ArrowColor when Dynamic Mode Colors is off)
+	local accentColor = resolveMoveAccentColor(sess, res)
 	if CONFIG.ShowHighlights and res.fromSq and res.toSq then
 		local fc, fr = sqColRow(res.fromSq, flipped)
 		local tc, tr = sqColRow(res.toSq, flipped)
@@ -4792,24 +5072,210 @@ local function setPulseStatus(status, detail)
 	end
 end
 
-local BADGE_COLORS = {
-	vpssf = Color3.fromRGB(52, 211, 255),
-	gm = Color3.fromRGB(72, 224, 168),
-	farm = Color3.fromRGB(245, 138, 86),
-	stockfish = Color3.fromRGB(56, 217, 169),
-	turbo = Color3.fromRGB(240, 86, 86),
-	localws = Color3.fromRGB(96, 185, 255),
-	luau = Color3.fromRGB(168, 130, 255),
-	fallback = Color3.fromRGB(235, 168, 76),
-	book = Color3.fromRGB(120, 210, 150),
-	puzzle = Color3.fromRGB(245, 196, 81),
-	thinking = Color3.fromRGB(245, 196, 81),
-	idle = Color3.fromRGB(110, 118, 138),
-}
+local function computeLiveFyi(sess, res, thinking)
+	local now = os.clock()
+	local f = STATE.Farm
+	local o = STATE.Opp
 
-local function updateEngineBadge(text, kind)
-	engineBadgeText.Text = text
-	engineBadgeDot.BackgroundColor3 = BADGE_COLORS[kind] or BADGE_COLORS.idle
+	-- 1. Idle / Lobby / Breather
+	if not sess or sess.kind == "idle" or not sess.engine then
+		if CONFIG.AutoFarm then
+			if f.breakUntil > now then
+				return "BREAK", string.format("Farm Breather · istirahat natural %.0fs sebelum antre", f.breakUntil - now), BADGE_COLORS.fallback
+			elseif not STATE.WindowFocused then
+				return "PAUSE", "Window tidak fokus — Auto-Farm pause biar aman", BADGE_COLORS.fallback
+			else
+				local b = Farm.getBucket and Farm.getBucket(f.activeClass)
+				if b then
+					return "FARM", string.format("Auto-Queue aktif · siklus +%d/%d Elo (Net %+d)", b.eloGainedSinceLoss, b.nextLossTargetElo, b.netElo), BADGE_COLORS.farm
+				end
+			end
+		end
+		return "READY", "Siap main! Drag kartu ini sesuka hati (double-click reset)", BADGE_COLORS.idle
+	end
+
+	if sess.over then
+		if CONFIG.AutoFarm and f.breakUntil > now then
+			return "BREAK", string.format("Match selesai · istirahat %.0fs sebelum match baru", f.breakUntil - now), BADGE_COLORS.fallback
+		end
+		return "DONE", "Match selesai · cek evaluasi atau siap lanjut!", BADGE_COLORS.idle
+	end
+
+	local myColor = sess.myColor or (sess.engine.side or 1)
+	local evalCp = (res and res.evalCp) or STATE.EvalWhiteCp or 0
+	local mateVal = (res and res.mate) or STATE.EvalMate
+	local myEval = evalCp * myColor
+	local myMate = mateVal and (mateVal * myColor) or nil
+	local ply = getSessionPly(sess)
+	local fullMove = math.floor(ply / 2) + 1
+	local fen = nil
+	pcall(function() fen = sess.engine:getFen() end)
+	local totalPieces = fen and countFenPieces(fen) or 32
+	local halfmove = 0
+	if type(fen) == "string" then
+		local parts = string.split(fen, " ")
+		halfmove = tonumber(parts[5]) or 0
+	end
+
+	-- 2. Forced Checkmate Alerts (highest excitement!)
+	if myMate and myMate > 0 then
+		if myMate == 1 then
+			return "MATE", "Skakmat dalam 1 langkah — tinggal eksekusi!", BADGE_COLORS.mate
+		elseif myMate <= 4 then
+			return "MATE", string.format("Skakmat otw dalam %d langkah! Sikat bersih!", myMate), BADGE_COLORS.mate
+		else
+			return "MATE", string.format("Jalur skakmat paksa terdeteksi (M%d)!", myMate), BADGE_COLORS.mate
+		end
+	elseif myMate and myMate < 0 then
+		return "DANGER", string.format("AWAS! Lawan punya skakmat paksa (M%d) — tahan!", math.abs(myMate)), BADGE_COLORS.turbo
+	end
+
+	-- 3. Auto-Farm Controlled-Loss & Guard Callouts
+	if CONFIG.AutoFarm and sess.kind == "online" then
+		if f.phase == "resigning" or f.resignPending then
+			return "FARM", "Jeda natural sebelum resign bersih (anti-rungkat aman)", BADGE_COLORS.farm
+		elseif f.throwArmed and (f.phase == "blunder" or f.phase == "weak") then
+			return "FARM", string.format("Farm Throw · blunder natural (%d/%d) biar streak ga sus", f.blunderMovesPlayed, f.maxBlunderMoves), BADGE_COLORS.farm
+		elseif f.throwArmed and f.phase == "opening" then
+			return "FARM", string.format("Kalah aman dijadwalkan di langkah #%d (opening normal)", f.throwStartMove), BADGE_COLORS.farm
+		elseif type(f.deferReason) == "string" and string.find(f.deferReason, "Deferred", 1, true) then
+			return "GUARD", "Anti-Rungkat: " .. f.deferReason, BADGE_COLORS.vpssf
+		end
+	end
+
+	-- 4. Anti-Engine Turbo & Suspect Alerts
+	if CONFIG.AntiEngineTurbo and sess.kind == "online" then
+		if o.engineDetected then
+			return "TURBO", string.format("Lawan terdeteksi ENGINE (%d%% · %d/%d) — Full SF19 + Turbo!", o.suspicion, o.hits, o.checked), BADGE_COLORS.turbo
+		elseif o.turboActive then
+			return "TURBO", "Tekanan waktu aktif — mode Turbo ngebut otomatis!", BADGE_COLORS.turbo
+		elseif o.suspect then
+			return "SUSPECT", string.format("Lawan main tajam banget (%d%%) — tempo dipercepat!", o.suspicion), BADGE_COLORS.suspect
+		end
+	end
+
+	-- 5. Tactical Highlights (Blunder, Ponder Hit, Sharp Only-Move, Promo, Auto-Adapt)
+	if res then
+		if res.evalSwing and res.evalSwing >= 200 and myEval >= 150 then
+			return "BLUNDER", string.format("Lawan blunder! Keunggulan naik ke +%.2f — hukum %s!", myEval / 100, res.san or res.best), BADGE_COLORS.gm
+		end
+		if res.prefetched and (res.ms or 0) <= 5 then
+			return "PONDER", "Ponder Hit 0ms! Balasan lawan sudah ketebak duluan!", BADGE_COLORS.vpssf
+		end
+		if res.promoChar then
+			return "PROMO", string.format("Promosi pion =%s siap dieksekusi!", res.promoChar), BADGE_COLORS.mate
+		end
+		if res.pvGapCp and res.pvGapCp >= 110 and not res.isCapture then
+			return "SHARP", string.format("Langkah kritis! %s satu-satunya jalan kuat (+%.2f gap)", res.san or res.best, res.pvGapCp / 100), BADGE_COLORS.mate
+		end
+		if res.isAdapted and res.effStyle then
+			return "ADAPT", string.format("Lawan kuat — engine otomatis naik ke %s!", res.effStyle), BADGE_COLORS.vpssf
+		end
+	end
+
+	-- 6. Draw / Repetition / 50-Move / Endgame Warnings
+	if halfmove >= 60 then
+		return "DRAW", string.format("Hati-hati aturan 50 langkah (%d/100 halfmove -> draw!)", halfmove), BADGE_COLORS.fallback
+	elseif totalPieces <= 4 and math.abs(myEval) <= 35 then
+		return "DRAW", "Sisa bidak sangat sedikit — kemungkinan besar DRAW!", BADGE_COLORS.fallback
+	elseif totalPieces <= 10 and math.abs(myEval) <= 25 then
+		return "ENDGAME", string.format("Endgame ketat (%d bidak) — potensi draw / adu tempo!", totalPieces), BADGE_COLORS.fallback
+	elseif ply >= 40 and math.abs(myEval) <= 18 then
+		return "DRAW", "Posisi sangat seimbang — potensi draw cukup tinggi", BADGE_COLORS.fallback
+	end
+
+	-- 7. Clock Drama Alerts (Online)
+	if sess.kind == "online" and sess.clocks and sess.myColor then
+		local myMs = getLiveClockMs(sess, sess.myColor)
+		local oppMs = getLiveClockMs(sess, -sess.myColor)
+		if myMs and oppMs then
+			local mySec = myMs / 1000
+			local oppSec = oppMs / 1000
+			if oppSec < 15 and mySec > (oppSec + 8) then
+				return "CLOCK", string.format("Waktu lawan sekarat (%.0fs) — terus kasih tekanan!", oppSec), BADGE_COLORS.gm
+			elseif mySec < 20 then
+				return "CLOCK", string.format("Waktu tipis (%.0fs) — mode gerak cepat aktif!", mySec), BADGE_COLORS.turbo
+			elseif (CONFIG.MaxClockLead or 30) > 0 and (mySec - oppSec) > (CONFIG.MaxClockLead or 30) and mySec >= 42 then
+				return "PACE", string.format("Unggul +%ds waktu — memperlambat natural biar ga sus", math.floor(mySec - oppSec)), BADGE_COLORS.vpssf
+			end
+		end
+	end
+
+	-- 8. Thinking / Waiting / General Position Commentary
+	if thinking then
+		return "CALC", "Menganalisis posisi & variasi terbaik...", BADGE_COLORS.thinking
+	end
+	if sess.myColor ~= nil and not sess:isMyTurn() then
+		local prefetching = (STATE.PrefetchDone ~= nil and not STATE.PrefetchDone.done)
+		if prefetching then
+			return "PONDER", "Menyiapkan balasan 0ms selagi lawan mikir...", BADGE_COLORS.vpssf
+		end
+		return "WAIT", "Menunggu langkah lawan · pantau akurasi & tempo", BADGE_COLORS.idle
+	end
+
+	if myEval >= 320 and totalPieces <= 12 then
+		return "WINNING", string.format("Menang telak (+%.2f) · konversi endgame bersih!", myEval / 100), BADGE_COLORS.gm
+	elseif myEval >= 180 then
+		return "AHEAD", string.format("Posisi unggul (+%.2f) — pertahankan inisiatif!", myEval / 100), BADGE_COLORS.gm
+	elseif myEval <= -180 then
+		return "DEFEND", string.format("Tertekan (%.2f) — cari counterplay & tahan posisi!", myEval / 100), BADGE_COLORS.fallback
+	elseif fullMove <= (CONFIG.FastOpeningMoves or 5) then
+		return "OPENING", string.format("Opening cepat (#%d) — hemat jam untuk middlegame", fullMove), BADGE_COLORS.book
+	elseif res and res.gmRank and res.gmRank > 1 then
+		return "GM", string.format("GM Mode pilih opsi #%d (-%dcp) biar main natural", res.gmRank, res.gmLossCp or 0), BADGE_COLORS.gm
+	end
+
+	return "INFO", "Posisi stabil · drag kartu ini bebas (double-click reset)", BADGE_COLORS.stockfish
+end
+
+local function updateEngineBadge(text, kind, sess, res, thinking)
+	if not HUD.root then
+		return
+	end
+	sess = sess or (STATE.App and STATE.App.session)
+	local col = BADGE_COLORS[kind] or BADGE_COLORS.idle
+	if res and res.mate and res.mate ~= 0 then
+		col = BADGE_COLORS.mate
+	end
+	HUD.lastKind = kind or "idle"
+	HUD.title.Text = text
+	HUD.dot.BackgroundColor3 = col
+	HUD.accentBar.BackgroundColor3 = col
+	HUD.stroke.Color = col
+
+	-- Update Eval Pill on right of Row 1
+	local evCp = (res and res.evalCp) or STATE.EvalWhiteCp or 0
+	local evMate = (res and res.mate) or STATE.EvalMate
+	local evTxt = (sess and sess.kind ~= "idle") and formatEvalText(evCp, evMate) or "--"
+	HUD.evalText.Text = evTxt
+	local myColor = (sess and sess.myColor) or 1
+	local myEv = evCp * myColor
+	local myM = evMate and (evMate * myColor) or nil
+	if myM and myM ~= 0 then
+		HUD.evalPill.BackgroundColor3 = (myM > 0) and Color3.fromRGB(72, 58, 22) or Color3.fromRGB(76, 26, 28)
+		HUD.evalText.TextColor3 = (myM > 0) and Color3.fromRGB(250, 214, 102) or Color3.fromRGB(255, 130, 130)
+	elseif myEv >= 120 then
+		HUD.evalPill.BackgroundColor3 = Color3.fromRGB(22, 56, 46)
+		HUD.evalText.TextColor3 = Color3.fromRGB(98, 240, 192)
+	elseif myEv <= -120 then
+		HUD.evalPill.BackgroundColor3 = Color3.fromRGB(64, 26, 30)
+		HUD.evalText.TextColor3 = Color3.fromRGB(250, 128, 128)
+	else
+		HUD.evalPill.BackgroundColor3 = Color3.fromRGB(30, 36, 48)
+		HUD.evalText.TextColor3 = Color3.fromRGB(226, 232, 244)
+	end
+
+	-- Update Interactive Live FYI Ticker on Row 2
+	local tag, msg, fyiCol = computeLiveFyi(sess, res, thinking)
+	HUD.fyiTag.Text = tag
+	HUD.fyiText.Text = msg
+	HUD.fyiPill.BackgroundColor3 = fyiCol
+	HUD.fyiStroke.Color = fyiCol
+	HUD.fyiTag.TextColor3 = Color3.new(
+		math.min(1, fyiCol.R + 0.16),
+		math.min(1, fyiCol.G + 0.16),
+		math.min(1, fyiCol.B + 0.16)
+	)
 end
 
 local function resetOpponentTracker(sess, gameId)
@@ -6017,7 +6483,7 @@ local function updateHudReadout(sess, res, thinking)
 		setUiLabel("EvalLabel", "Eval: 0.00  ·  Ready")
 		setUiLabel("LineLabel", "Line: Start a match, bot game, or puzzle.")
 		setPulseStatus("Idle", "Standby · " .. CONFIG.EngineMode)
-		updateEngineBadge("Standby · " .. CONFIG.EngineMode, "idle")
+		updateEngineBadge("Standby · " .. CONFIG.EngineMode, "idle", sess, nil, false)
 		return
 	end
 
@@ -6047,7 +6513,7 @@ local function updateHudReadout(sess, res, thinking)
 		setUiLabel("BestMoveLabel", "Best Move: Calculating...")
 		setUiLabel("EvalLabel", "Eval: --")
 		setPulseStatus("Thinking", activeName .. turboTag)
-		updateEngineBadge(activeName .. turboTag .. " ...", "thinking")
+		updateEngineBadge(activeName .. turboTag .. " ...", "thinking", sess, nil, true)
 		return
 	end
 
@@ -6068,7 +6534,7 @@ local function updateHudReadout(sess, res, thinking)
 		STATE.EvalMate = res.mate
 		updateEvalBarVisual(res.evalCp, res.mate, STATE.Board and STATE.Board.flipped == true)
 		setPulseStatus(engName .. turboTag, (res.san or res.best) .. " (" .. evStr .. ")" .. depthTag)
-		updateEngineBadge(engName .. depthTag .. msTag .. turboTag, engKind)
+		updateEngineBadge(engName .. depthTag .. msTag .. turboTag, engKind, sess, res, false)
 	else
 		local isTerminal = (STATE.TerminalKey ~= "" and STATE.TerminalKey == STATE.LastKey)
 		local prefetching = (STATE.PrefetchDone ~= nil and not STATE.PrefetchDone.done)
@@ -6079,7 +6545,7 @@ local function updateHudReadout(sess, res, thinking)
 		setUiLabel("EvalLabel", "Eval: --")
 		setUiLabel("LineLabel", "Line: --")
 		setPulseStatus((sess.over or isTerminal) and "Finished" or "Waiting", kindCap .. " · " .. turnTxt)
-		updateEngineBadge(((sess.over or isTerminal) and "Game Over" or waitTxt) .. turboTag, (STATE.Opp.turboActive and CONFIG.AntiEngineTurbo and sess.kind == "online") and "turbo" or "idle")
+		updateEngineBadge(((sess.over or isTerminal) and "Game Over" or waitTxt) .. turboTag, (STATE.Opp.turboActive and CONFIG.AntiEngineTurbo and sess.kind == "online") and "turbo" or "idle", sess, nil, false)
 	end
 end
 
@@ -6486,7 +6952,7 @@ task.spawn(function()
 			triggerRecalc(false)
 		end
 
-		-- Periodic watchdogs, Auto-Farm Elo & clock checks at 0.10s
+		-- Periodic watchdogs, Auto-Farm Elo, live FYI ticker & clock checks at 0.10s
 		if now - lastCheck >= 0.10 then
 			lastCheck = now
 			if not plyChanged then
@@ -6496,6 +6962,20 @@ task.spawn(function()
 			end
 			tickWatchdogs(app, sess, now)
 			tickAutoFindMatch(app, sess, now)
+			-- Live-refresh interactive FYI ticker every ~0.35s so clock/breather/draw callouts stay fresh
+			if HUD.root and HUD.root.Visible and (now - (HUD.lastFyiAt or 0)) >= 0.35 then
+				HUD.lastFyiAt = now
+				local tag, msg, fyiCol = computeLiveFyi(sess, STATE.CurrentResult, STATE.Searching)
+				HUD.fyiTag.Text = tag
+				HUD.fyiText.Text = msg
+				HUD.fyiPill.BackgroundColor3 = fyiCol
+				HUD.fyiStroke.Color = fyiCol
+				HUD.fyiTag.TextColor3 = Color3.new(
+					math.min(1, fyiCol.R + 0.16),
+					math.min(1, fyiCol.G + 0.16),
+					math.min(1, fyiCol.B + 0.16)
+				)
+			end
 		end
 	end))
 end)
