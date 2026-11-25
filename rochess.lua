@@ -1,8 +1,8 @@
 --!nocheck
 --[[
-	BeverlyHub v2.3.0 — RoChess!
+	BeverlyHub v2.4.0 — RoChess!
 	Hybrid Chess Engine (Stockfish 19 VPS + Cloud + Independent Offline Luau Engine)
-	Board Arrow Overlay, Expressive Coach HUD, Broadcast Eval Bar & Safe Auto Play
+	RoChess-Native Coach HUD, Broadcast Eval Bar, Spectator Turbo Guard & Auto Next Puzzle
 ]]
 
 if not game:IsLoaded() then
@@ -31,7 +31,7 @@ end
 
 local LIB_BASE = "https://raw.githubusercontent.com/bevankeren/BeverlyLIB/main/"
 local REMOTE_SCRIPT_URL = "https://raw.githubusercontent.com/bevankeren/rochess/main/rochess.lua"
-local HUB_VERSION = "2.3.0"
+local HUB_VERSION = "2.4.0"
 
 -- ============================================================================
 -- 1. CONFIGURATION & RUNTIME STATE
@@ -57,7 +57,9 @@ local CONFIG = {
 	OnlyMyTurn = true,
 	PuzzleHelper = true,
 	AntiEngineTurbo = true, -- Auto-detect engine opponent + ponder prefetch + fast mode
+	PauseTurboOnSpectate = true, -- Automatically pause Turbo while spectators are watching, resume when 0
 	AutoPlay = false, -- OFF by default
+	AutoNextPuzzle = false, -- OFF by default (auto-clicks Next when a puzzle finishes)
 	AutoDelayMin = 1.0, -- seconds (middlegame base min)
 	AutoDelayMax = 5.0, -- seconds (middlegame base max)
 	SmartDelay = true, -- Fast opening & endgame, complexity middlegame, clock-aware cap
@@ -146,13 +148,20 @@ local STATE = {
 		clockPressure = false,
 		turboActive = false,
 		turboReason = nil,
+		spectators = 0,
+		spectatorPaused = false,
+		spectatorNotified = false,
 		notified = false,
 		adaptTier = nil,
 		lastAdaptPly = -1,
 	},
-	-- Auto Find Match & Auto-Farm Elo state
+	-- Auto Find Match, Auto Next Puzzle & Auto-Farm Elo state
 	AutoFindOverAt = 0,
 	AutoFindLastQueueAt = 0,
+	PuzzleDoneKey = "",
+	PuzzleDoneAt = 0,
+	PuzzleNextDelay = 1.15,
+	PuzzleNextClickAt = 0,
 	Farm = {
 		data = nil,
 		activeClass = nil,
@@ -2369,7 +2378,7 @@ local function computeQueryProfile(session, turbo, suspect)
 	if vpsReady
 		and not turbo
 		and not suspect
-		and not STATE.Opp.engineDetected
+		and not (STATE.Opp.engineDetected and not STATE.Opp.spectatorPaused)
 		and effStyle ~= "Full"
 		and session
 		and (session.kind == "online" or session.kind == "bot")
@@ -2652,7 +2661,7 @@ local function launchPonderPrefetch(curFen, ponderUci, session)
 	local nextFen = b:getFen()
 	local f4 = fen4Key(nextFen)
 
-	local turbo = CONFIG.AntiEngineTurbo and (STATE.Opp.turboActive or STATE.Opp.engineDetected)
+	local turbo = CONFIG.AntiEngineTurbo and STATE.Opp.turboActive
 	local suspect = CONFIG.AntiEngineTurbo and STATE.Opp.suspect
 	local prof = computeQueryProfile(session, turbo, suspect)
 	local cKey = f4 .. "|" .. prof.cacheGroup
@@ -3057,35 +3066,22 @@ local BADGE_COLORS = {
 	idle = Color3.fromRGB(110, 118, 138),
 }
 
--- Expressive Draggable Chess Coach HUD (direct child of overlayGui, zero touch on ChessUI)
+-- RoChess-Native Draggable Coach HUD (studio-illustrated vector Coach avatars, clean BuilderSans typography)
 local HUD = {
 	root = nil,
+	card = nil,
 	stroke = nil,
-	accentBar = nil,
 	dot = nil,
 	title = nil,
 	evalPill = nil,
+	evalStroke = nil,
 	evalText = nil,
 	fyiText = nil,
 	grip = nil,
-	-- Animated Chibi Coach Portrait parts
-	avatarBg = nil,
+	avatarFrame = nil,
+	avatarImg = nil,
 	avatarRing = nil,
-	coachRig = nil,
-	eyeL = nil,
-	eyeR = nil,
-	sparkL = nil,
-	sparkR = nil,
-	scleraL = nil,
-	scleraR = nil,
-	browL = nil,
-	browR = nil,
-	mouth = nil,
-	mouthInner = nil,
-	shades = nil,
-	sweat = nil,
-	sparkle = nil,
-	crown = nil,
+	avatarAssets = {},
 	-- Runtime state
 	dragging = false,
 	customPos = false,
@@ -3094,181 +3090,82 @@ local HUD = {
 	lastKind = "idle",
 	lastMood = "",
 	lastMsg = "",
-	nextBlinkAt = 0,
-	blinkEndAt = 0,
 	bounceStartAt = 0,
-	eyesOpen = true,
 	hovered = false,
 }
 
-local COACH_MOOD_BG = {
-	calm = Color3.fromRGB(38, 46, 56),
-	hyped = Color3.fromRGB(62, 52, 28),
-	smug = Color3.fromRGB(30, 52, 46),
-	cool = Color3.fromRGB(58, 30, 34),
-	thinking = Color3.fromRGB(38, 42, 60),
-	panic = Color3.fromRGB(64, 30, 34),
-	draw = Color3.fromRGB(48, 48, 54),
-	mischief = Color3.fromRGB(58, 42, 30),
-	sleepy = Color3.fromRGB(36, 40, 50),
-}
+local COACH_ASSET_BASE = "https://raw.githubusercontent.com/bevankeren/rochess/main/assets/coach/"
+local COACH_MOODS = { "calm", "hyped", "smug", "cool", "panic", "thinking", "draw", "mischief", "sleepy" }
+local COACH_FALLBACK_THUMB = string.format("rbxthumb://type=AvatarHeadShot&id=%d&w=150&h=150", LocalPlayer.UserId)
+
+local function preloadCoachAvatars()
+	local getAssetFn = (type(getcustomasset) == "function" and getcustomasset)
+		or (type(getsynasset) == "function" and getsynasset)
+		or nil
+	if not getAssetFn or type(writefile) ~= "function" or type(isfile) ~= "function" then
+		return
+	end
+	if type(isfolder) == "function" and type(makefolder) == "function" then
+		pcall(function()
+			if not isfolder("BeverlyHub") then makefolder("BeverlyHub") end
+			if not isfolder("BeverlyHub/RoChess") then makefolder("BeverlyHub/RoChess") end
+			if not isfolder("BeverlyHub/RoChess/coach_v1") then makefolder("BeverlyHub/RoChess/coach_v1") end
+		end)
+	end
+	local function fetchBytes(url)
+		local ok, body = pcall(function() return game:HttpGet(url) end)
+		if ok and type(body) == "string" and #body > 200 and string.sub(body, 1, 4) == "\137PNG" then
+			return body
+		end
+		if type(httpRequest) == "function" then
+			local rok, rres = pcall(httpRequest, { Url = url, Method = "GET" })
+			if rok and type(rres) == "table" and rres.Success and type(rres.Body) == "string"
+				and #rres.Body > 200 and string.sub(rres.Body, 1, 4) == "\137PNG"
+			then
+				return rres.Body
+			end
+		end
+		return nil
+	end
+	task.spawn(function()
+		for _, mood in ipairs(COACH_MOODS) do
+			if not STATE.Alive then
+				return
+			end
+			local path = "BeverlyHub/RoChess/coach_v1/" .. mood .. ".png"
+			local ready = false
+			local okExist, exists = pcall(isfile, path)
+			if okExist and exists then
+				ready = true
+			else
+				local png = fetchBytes(COACH_ASSET_BASE .. mood .. ".png")
+				if png then
+					local okW = pcall(writefile, path, png)
+					ready = okW == true
+				end
+			end
+			if ready then
+				local okId, assetId = pcall(getAssetFn, path)
+				if okId and type(assetId) == "string" and assetId ~= "" then
+					HUD.avatarAssets[mood] = assetId
+					if HUD.avatarImg and (HUD.lastMood == mood or (HUD.lastMood == "" and mood == "calm")) then
+						HUD.avatarImg.Image = assetId
+					end
+				end
+			end
+		end
+	end)
+end
 
 local function applyCoachMood(mood)
 	mood = mood or "calm"
-	if HUD.lastMood == mood or not HUD.avatarBg then
+	if HUD.lastMood == mood or not HUD.avatarImg then
 		return
 	end
 	HUD.lastMood = mood
-	local bg = COACH_MOOD_BG[mood] or COACH_MOOD_BG.calm
-	HUD.avatarBg.BackgroundColor3 = bg
-
-	-- Reset defaults cleanly before styling active expression
-	HUD.shades.Visible = false
-	HUD.sweat.Visible = false
-	HUD.sparkle.Visible = false
-	HUD.scleraL.Visible = false
-	HUD.scleraR.Visible = false
-	HUD.browL.Visible = false
-	HUD.browR.Visible = false
-	HUD.mouthInner.Visible = false
-	HUD.sparkL.Visible = true
-	HUD.sparkR.Visible = true
-	HUD.eyeL.Visible = true
-	HUD.eyeR.Visible = true
-	HUD.eyesOpen = true
-
-	-- Base positions inside 28x26 head
-	HUD.eyeL.Size = UDim2.fromOffset(5, 6)
-	HUD.eyeR.Size = UDim2.fromOffset(5, 6)
-	HUD.eyeL.Position = UDim2.fromOffset(9, 12)
-	HUD.eyeR.Position = UDim2.fromOffset(19, 12)
-	HUD.eyeL.BackgroundColor3 = Color3.fromRGB(28, 30, 38)
-	HUD.eyeR.BackgroundColor3 = Color3.fromRGB(28, 30, 38)
-	HUD.sparkL.Position = UDim2.fromOffset(1, 1)
-	HUD.sparkR.Position = UDim2.fromOffset(1, 1)
-	HUD.sparkL.Size = UDim2.fromOffset(2, 2)
-	HUD.sparkR.Size = UDim2.fromOffset(2, 2)
-	HUD.sparkL.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-	HUD.sparkR.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-
-	HUD.mouth.Position = UDim2.fromOffset(14, 19)
-	HUD.mouth.Size = UDim2.fromOffset(7, 3)
-	HUD.mouth.Rotation = 0
-	HUD.mouth.BackgroundColor3 = Color3.fromRGB(78, 52, 48)
-	HUD.crown.Rotation = -5
-
-	if mood == "hyped" then
-		-- Big sparkling excited eyes + happy open smile + golden crown gleam
-		HUD.eyeL.Size = UDim2.fromOffset(6, 7)
-		HUD.eyeR.Size = UDim2.fromOffset(6, 7)
-		HUD.sparkL.Size = UDim2.fromOffset(3, 3)
-		HUD.sparkR.Size = UDim2.fromOffset(3, 3)
-		HUD.sparkL.BackgroundColor3 = Color3.fromRGB(255, 232, 140)
-		HUD.sparkR.BackgroundColor3 = Color3.fromRGB(255, 232, 140)
-		HUD.browL.Visible = true
-		HUD.browR.Visible = true
-		HUD.browL.Position = UDim2.fromOffset(9, 6)
-		HUD.browR.Position = UDim2.fromOffset(19, 6)
-		HUD.browL.Rotation = -10
-		HUD.browR.Rotation = 10
-		HUD.mouth.Size = UDim2.fromOffset(9, 5)
-		HUD.mouth.Position = UDim2.fromOffset(14, 20)
-		HUD.mouthInner.Visible = true
-		HUD.sparkle.Visible = true
-		HUD.crown.Rotation = -2
-	elseif mood == "smug" then
-		-- Cheeky half-lidded eyes + cocked eyebrow + asymmetric smirk
-		HUD.eyeL.Size = UDim2.fromOffset(6, 4)
-		HUD.eyeR.Size = UDim2.fromOffset(6, 4)
-		HUD.eyeL.Position = UDim2.fromOffset(9, 13)
-		HUD.eyeR.Position = UDim2.fromOffset(19, 13)
-		HUD.browL.Visible = true
-		HUD.browR.Visible = true
-		HUD.browL.Position = UDim2.fromOffset(9, 8)
-		HUD.browR.Position = UDim2.fromOffset(19, 6)
-		HUD.browL.Rotation = 6
-		HUD.browR.Rotation = -16
-		HUD.mouth.Size = UDim2.fromOffset(8, 3)
-		HUD.mouth.Position = UDim2.fromOffset(15, 19)
-		HUD.mouth.Rotation = -10
-		HUD.sparkle.Visible = true
-	elseif mood == "cool" then
-		-- Sleek dark sunglasses + confident grin (Turbo / Engine Detected)
-		HUD.shades.Visible = true
-		HUD.eyeL.Visible = false
-		HUD.eyeR.Visible = false
-		HUD.eyesOpen = false
-		HUD.mouth.Size = UDim2.fromOffset(8, 3)
-		HUD.mouth.Position = UDim2.fromOffset(15, 19)
-		HUD.mouth.Rotation = -9
-		HUD.crown.Rotation = -9
-	elseif mood == "thinking" then
-		-- Eyes glancing up-right + furrowed brow + tiny "hmm" mouth
-		HUD.eyeL.Position = UDim2.fromOffset(10, 11)
-		HUD.eyeR.Position = UDim2.fromOffset(20, 11)
-		HUD.browL.Visible = true
-		HUD.browR.Visible = true
-		HUD.browL.Position = UDim2.fromOffset(9, 7)
-		HUD.browR.Position = UDim2.fromOffset(19, 6)
-		HUD.browL.Rotation = 12
-		HUD.browR.Rotation = -6
-		HUD.mouth.Size = UDim2.fromOffset(4, 3)
-		HUD.mouth.Position = UDim2.fromOffset(15, 20)
-	elseif mood == "panic" then
-		-- Wide shocked eyes + open "O" mouth + temple sweat drop
-		HUD.scleraL.Visible = true
-		HUD.scleraR.Visible = true
-		HUD.eyeL.Size = UDim2.fromOffset(3, 4)
-		HUD.eyeR.Size = UDim2.fromOffset(3, 4)
-		HUD.sparkL.Visible = false
-		HUD.sparkR.Visible = false
-		HUD.eyesOpen = false
-		HUD.browL.Visible = true
-		HUD.browR.Visible = true
-		HUD.browL.Position = UDim2.fromOffset(9, 6)
-		HUD.browR.Position = UDim2.fromOffset(19, 6)
-		HUD.browL.Rotation = -18
-		HUD.browR.Rotation = 18
-		HUD.mouth.Size = UDim2.fromOffset(6, 6)
-		HUD.mouth.Position = UDim2.fromOffset(14, 20)
-		HUD.sweat.Visible = true
-		HUD.crown.Rotation = 6
-	elseif mood == "draw" then
-		-- Classic deadpan (- _ -) unimpressed face
-		HUD.eyeL.Size = UDim2.fromOffset(6, 2)
-		HUD.eyeR.Size = UDim2.fromOffset(6, 2)
-		HUD.eyeL.Position = UDim2.fromOffset(9, 13)
-		HUD.eyeR.Position = UDim2.fromOffset(19, 13)
-		HUD.sparkL.Visible = false
-		HUD.sparkR.Visible = false
-		HUD.eyesOpen = false
-		HUD.mouth.Size = UDim2.fromOffset(7, 2)
-		HUD.mouth.Position = UDim2.fromOffset(14, 19)
-	elseif mood == "mischief" then
-		-- Innocent sideways whistling look (Auto-Farm Throw)
-		HUD.eyeL.Position = UDim2.fromOffset(11, 12)
-		HUD.eyeR.Position = UDim2.fromOffset(21, 12)
-		HUD.eyeL.Size = UDim2.fromOffset(5, 5)
-		HUD.eyeR.Size = UDim2.fromOffset(5, 5)
-		HUD.browL.Visible = true
-		HUD.browR.Visible = true
-		HUD.browL.Position = UDim2.fromOffset(9, 7)
-		HUD.browR.Position = UDim2.fromOffset(19, 7)
-		HUD.browL.Rotation = -10
-		HUD.browR.Rotation = 10
-		HUD.mouth.Size = UDim2.fromOffset(4, 4)
-		HUD.mouth.Position = UDim2.fromOffset(15, 20)
-	elseif mood == "sleepy" then
-		-- Cozy resting closed eyes (Idle / Farm Breather)
-		HUD.eyeL.Size = UDim2.fromOffset(6, 2)
-		HUD.eyeR.Size = UDim2.fromOffset(6, 2)
-		HUD.eyeL.Position = UDim2.fromOffset(9, 14)
-		HUD.eyeR.Position = UDim2.fromOffset(19, 14)
-		HUD.sparkL.Visible = false
-		HUD.sparkR.Visible = false
-		HUD.eyesOpen = false
-		HUD.mouth.Size = UDim2.fromOffset(5, 2)
-		HUD.mouth.Position = UDim2.fromOffset(14, 19)
+	local imgId = HUD.avatarAssets[mood] or HUD.avatarAssets.calm or COACH_FALLBACK_THUMB
+	if HUD.avatarImg.Image ~= imgId then
+		HUD.avatarImg.Image = imgId
 	end
 end
 
@@ -3276,13 +3173,21 @@ function HUD.say(msg, mood, accentCol)
 	if not HUD.fyiText then
 		return
 	end
-	local col = accentCol or Color3.fromRGB(122, 132, 152)
 	applyCoachMood(mood)
 	if HUD.avatarRing then
-		HUD.avatarRing.Color = col
-	end
-	if HUD.accentBar then
-		HUD.accentBar.BackgroundColor3 = col
+		local ringCol = Color3.fromRGB(72, 76, 86)
+		if mood == "hyped" then
+			ringCol = Color3.fromRGB(242, 190, 66)
+		elseif mood == "panic" or mood == "cool" then
+			ringCol = Color3.fromRGB(214, 72, 68)
+		elseif mood == "smug" then
+			ringCol = Color3.fromRGB(46, 196, 182)
+		elseif mood == "mischief" then
+			ringCol = Color3.fromRGB(245, 166, 65)
+		elseif accentCol then
+			ringCol = Color3.fromRGB(72, 76, 86):Lerp(accentCol, 0.45)
+		end
+		HUD.avatarRing.Color = ringCol
 	end
 	if HUD.lastMsg ~= msg then
 		HUD.lastMsg = msg
@@ -3292,406 +3197,124 @@ function HUD.say(msg, mood, accentCol)
 end
 
 function HUD.tickAnim(now)
-	if not HUD.coachRig then
-		return
-	end
-	-- Gentle idle breathing + subtle snappy hop whenever coach delivers a new line
-	local bob = math.sin(now * 2.2) * 0.9
-	local dtBounce = now - (HUD.bounceStartAt or 0)
-	if dtBounce >= 0 and dtBounce < 0.24 then
-		local t = dtBounce / 0.24
-		bob -= math.sin(t * math.pi) * 3.0
-	end
-	HUD.coachRig.Position = UDim2.fromOffset(0, math.floor(bob + 0.5))
-
-	-- Natural periodic blinking on open-eye moods
-	if HUD.eyesOpen and HUD.eyeL and HUD.eyeR then
-		if now >= (HUD.nextBlinkAt or 0) then
-			HUD.blinkEndAt = now + 0.11
-			HUD.nextBlinkAt = now + 3.0 + math.random() * 2.6
+	-- Subtle crisp pop-bounce on avatar when Coach drops a new line
+	if HUD.avatarFrame then
+		local dt = now - (HUD.bounceStartAt or 0)
+		local yOff = 10
+		if dt >= 0 and dt < 0.22 then
+			yOff = 10 - math.floor(math.sin((dt / 0.22) * math.pi) * 2.6 + 0.5)
 		end
-		local blinking = now < (HUD.blinkEndAt or 0)
-		local scaleY = blinking and 0.22 or 1
-		if HUD.eyeL.Visible then
-			local baseH = (HUD.lastMood == "hyped") and 7
-				or ((HUD.lastMood == "smug" or HUD.lastMood == "panic") and 4 or ((HUD.lastMood == "mischief") and 5 or 6))
-			local curH = blinking and 2 or baseH
-			if HUD.eyeL.Size.Y.Offset ~= curH then
-				HUD.eyeL.Size = UDim2.fromOffset(HUD.eyeL.Size.X.Offset, curH)
-				HUD.eyeR.Size = UDim2.fromOffset(HUD.eyeR.Size.X.Offset, curH)
-				if HUD.lastMood ~= "panic" then
-					HUD.sparkL.Visible = (scaleY > 0.5)
-					HUD.sparkR.Visible = (scaleY > 0.5)
-				end
-			end
+		if HUD.avatarFrame.Position.Y.Offset ~= yOff then
+			HUD.avatarFrame.Position = UDim2.fromOffset(12, yOff)
 		end
 	end
-
-	-- Soft status dot pulse only when actively thinking or in turbo
+	-- Gentle dot pulse only while actively thinking or Turbo
 	if HUD.dot then
 		if HUD.lastKind == "thinking" or HUD.lastKind == "turbo" then
-			HUD.dot.BackgroundTransparency = 0.08 + 0.36 * (0.5 + 0.5 * math.sin(now * 6.5))
+			HUD.dot.BackgroundTransparency = 0.08 + 0.38 * (0.5 + 0.5 * math.sin(now * 6.0))
 		else
-			HUD.dot.BackgroundTransparency = (HUD.lastKind == "idle") and 0.35 or 0.08
+			HUD.dot.BackgroundTransparency = (HUD.lastKind == "idle") and 0.35 or 0.06
 		end
 	end
 end
 
 do
+	-- Transparent outer wrapper keeps card + soft drop-shadow locked together while dragging
+	local wrap = Instance.new("Frame")
+	wrap.Name = "TacticalHudCard"
+	wrap.AnchorPoint = Vector2.new(0.5, 0)
+	wrap.Position = UDim2.new(0.5, 0, 0, 10)
+	wrap.Size = UDim2.fromOffset(436, 78)
+	wrap.BackgroundTransparency = 1
+	wrap.BorderSizePixel = 0
+	wrap.Active = true
+	wrap.ZIndex = 12
+	wrap.Visible = false
+	wrap.Parent = overlayGui
+	HUD.root = wrap
+
+	local shadow = Instance.new("Frame")
+	shadow.Name = "DropShadow"
+	shadow.Position = UDim2.fromOffset(0, 3)
+	shadow.Size = UDim2.new(1, 0, 1, -2)
+	shadow.BackgroundColor3 = Color3.fromRGB(10, 11, 14)
+	shadow.BackgroundTransparency = 0.52
+	shadow.BorderSizePixel = 0
+	shadow.ZIndex = 11
+	shadow.Parent = wrap
+	local shCorner = Instance.new("UICorner")
+	shCorner.CornerRadius = UDim.new(0, 14)
+	shCorner.Parent = shadow
+
+	-- Main RoChess-native matte panel (Theme.panelHeader = 36,38,42; Theme.outline = 64,68,76)
 	local card = Instance.new("Frame")
-	card.Name = "TacticalHudCard"
-	card.AnchorPoint = Vector2.new(0.5, 0)
-	card.Position = UDim2.new(0.5, 0, 0, 10)
-	card.Size = UDim2.fromOffset(424, 70)
-	card.BackgroundColor3 = Color3.fromRGB(22, 24, 31)
-	card.BackgroundTransparency = 0.04
+	card.Name = "CoachCard"
+	card.Position = UDim2.fromOffset(0, 0)
+	card.Size = UDim2.new(1, 0, 1, -2)
+	card.BackgroundColor3 = Color3.fromRGB(36, 38, 42)
+	card.BackgroundTransparency = 0.02
 	card.BorderSizePixel = 0
-	card.Active = true
 	card.ClipsDescendants = true
 	card.ZIndex = 12
-	card.Visible = false
-	card.Parent = overlayGui
-	HUD.root = card
+	card.Parent = wrap
+	HUD.card = card
 
 	local corner = Instance.new("UICorner")
-	corner.CornerRadius = UDim.new(0, 12)
+	corner.CornerRadius = UDim.new(0, 14)
 	corner.Parent = card
 
 	local stroke = Instance.new("UIStroke")
-	stroke.Color = Color3.fromRGB(50, 55, 68)
-	stroke.Thickness = 1.2
-	stroke.Transparency = 0.14
+	stroke.Color = Color3.fromRGB(64, 68, 76)
+	stroke.Thickness = 1.1
+	stroke.Transparency = 0.08
 	stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 	stroke.Parent = card
 	HUD.stroke = stroke
 
-	-- Left Circular Chibi Coach Portrait (52x52)
-	local avatarBg = Instance.new("Frame")
-	avatarBg.Name = "CoachAvatar"
-	avatarBg.Position = UDim2.fromOffset(10, 9)
-	avatarBg.Size = UDim2.fromOffset(52, 52)
-	avatarBg.BackgroundColor3 = COACH_MOOD_BG.calm
-	avatarBg.BorderSizePixel = 0
-	avatarBg.ClipsDescendants = true
-	avatarBg.ZIndex = 13
-	avatarBg.Parent = card
-	HUD.avatarBg = avatarBg
+	-- Circular Studio-Illustrated Coach Portrait (56x56)
+	local avFrame = Instance.new("Frame")
+	avFrame.Name = "CoachPortrait"
+	avFrame.Position = UDim2.fromOffset(12, 10)
+	avFrame.Size = UDim2.fromOffset(56, 56)
+	avFrame.BackgroundColor3 = Color3.fromRGB(48, 52, 62)
+	avFrame.BorderSizePixel = 0
+	avFrame.ClipsDescendants = true
+	avFrame.ZIndex = 13
+	avFrame.Parent = card
+	HUD.avatarFrame = avFrame
 
 	local avCorner = Instance.new("UICorner")
 	avCorner.CornerRadius = UDim.new(1, 0)
-	avCorner.Parent = avatarBg
+	avCorner.Parent = avFrame
 
 	local avRing = Instance.new("UIStroke")
-	avRing.Color = Color3.fromRGB(98, 112, 134)
-	avRing.Thickness = 1.5
-	avRing.Transparency = 0.25
+	avRing.Color = Color3.fromRGB(72, 76, 86)
+	avRing.Thickness = 1.6
+	avRing.Transparency = 0.08
 	avRing.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
-	avRing.Parent = avatarBg
+	avRing.Parent = avFrame
 	HUD.avatarRing = avRing
 
-	-- Animated coach rig inside circular mask
-	local rig = Instance.new("Frame")
-	rig.Name = "CoachRig"
-	rig.BackgroundTransparency = 1
-	rig.Size = UDim2.fromScale(1, 1)
-	rig.ZIndex = 14
-	rig.Parent = avatarBg
-	HUD.coachRig = rig
+	local avImg = Instance.new("ImageLabel")
+	avImg.Name = "AvatarImg"
+	avImg.BackgroundTransparency = 1
+	avImg.Size = UDim2.fromScale(1, 1)
+	avImg.ScaleType = Enum.ScaleType.Crop
+	avImg.Image = COACH_FALLBACK_THUMB
+	avImg.ZIndex = 14
+	avImg.Parent = avFrame
+	local imgCorner = Instance.new("UICorner")
+	imgCorner.CornerRadius = UDim.new(1, 0)
+	imgCorner.Parent = avImg
+	HUD.avatarImg = avImg
 
-	-- Shoulders / Coach Sweater + Collar + Tiny Bowtie
-	local body = Instance.new("Frame")
-	body.Name = "Shoulders"
-	body.AnchorPoint = Vector2.new(0.5, 0.5)
-	body.Position = UDim2.fromOffset(26, 48)
-	body.Size = UDim2.fromOffset(38, 20)
-	body.BackgroundColor3 = Color3.fromRGB(48, 56, 72)
-	body.BorderSizePixel = 0
-	body.ZIndex = 14
-	body.Parent = rig
-	local bc = Instance.new("UICorner")
-	bc.CornerRadius = UDim.new(0.45, 0)
-	bc.Parent = body
-
-	local collar = Instance.new("Frame")
-	collar.AnchorPoint = Vector2.new(0.5, 0.5)
-	collar.Position = UDim2.fromOffset(26, 41)
-	collar.Size = UDim2.fromOffset(12, 5)
-	collar.BackgroundColor3 = Color3.fromRGB(232, 226, 214)
-	collar.BorderSizePixel = 0
-	collar.ZIndex = 15
-	collar.Parent = rig
-	local cc = Instance.new("UICorner")
-	cc.CornerRadius = UDim.new(0, 2)
-	cc.Parent = collar
-
-	local bowtie = Instance.new("Frame")
-	bowtie.AnchorPoint = Vector2.new(0.5, 0.5)
-	bowtie.Position = UDim2.fromOffset(26, 43)
-	bowtie.Size = UDim2.fromOffset(7, 4)
-	bowtie.BackgroundColor3 = Color3.fromRGB(214, 158, 62)
-	bowtie.BorderSizePixel = 0
-	bowtie.ZIndex = 16
-	bowtie.Parent = rig
-	local btc = Instance.new("UICorner")
-	btc.CornerRadius = UDim.new(0, 2)
-	btc.Parent = bowtie
-
-	-- Ivory Chess-Piece Chibi Head
-	local head = Instance.new("Frame")
-	head.Name = "Head"
-	head.AnchorPoint = Vector2.new(0.5, 0.5)
-	head.Position = UDim2.fromOffset(26, 28)
-	head.Size = UDim2.fromOffset(28, 26)
-	head.BackgroundColor3 = Color3.fromRGB(246, 236, 218)
-	head.BorderSizePixel = 0
-	head.ZIndex = 15
-	head.Parent = rig
-	local hc = Instance.new("UICorner")
-	hc.CornerRadius = UDim.new(0.46, 0)
-	hc.Parent = head
-	local hst = Instance.new("UIStroke")
-	hst.Color = Color3.fromRGB(206, 188, 160)
-	hst.Thickness = 1
-	hst.Transparency = 0.35
-	hst.Parent = head
-
-	-- Jaunty Mini Golden Chess Crown
-	local crown = Instance.new("Frame")
-	crown.Name = "Crown"
-	crown.AnchorPoint = Vector2.new(0.5, 0.5)
-	crown.Position = UDim2.fromOffset(26, 13)
-	crown.Size = UDim2.fromOffset(18, 10)
-	crown.Rotation = -5
-	crown.BackgroundTransparency = 1
-	crown.ZIndex = 17
-	crown.Parent = rig
-	HUD.crown = crown
-
-	local goldCol = Color3.fromRGB(232, 182, 68)
-	local cBase = Instance.new("Frame")
-	cBase.Position = UDim2.fromOffset(1, 6)
-	cBase.Size = UDim2.fromOffset(16, 4)
-	cBase.BackgroundColor3 = goldCol
-	cBase.BorderSizePixel = 0
-	cBase.ZIndex = 17
-	cBase.Parent = crown
-	local cbc = Instance.new("UICorner")
-	cbc.CornerRadius = UDim.new(0, 2)
-	cbc.Parent = cBase
-
-	for _, tSpec in ipairs({ { 1, 2, 4, 6 }, { 7, 0, 4, 8 }, { 13, 2, 4, 6 } }) do
-		local tine = Instance.new("Frame")
-		tine.Position = UDim2.fromOffset(tSpec[1], tSpec[2])
-		tine.Size = UDim2.fromOffset(tSpec[3], tSpec[4])
-		tine.BackgroundColor3 = goldCol
-		tine.BorderSizePixel = 0
-		tine.ZIndex = 17
-		tine.Parent = crown
-		local tc = Instance.new("UICorner")
-		tc.CornerRadius = UDim.new(0.5, 0)
-		tc.Parent = tine
-	end
-
-	-- Rosy Cheeks
-	for _, cx in ipairs({ 6, 22 }) do
-		local ch = Instance.new("Frame")
-		ch.AnchorPoint = Vector2.new(0.5, 0.5)
-		ch.Position = UDim2.fromOffset(cx, 17)
-		ch.Size = UDim2.fromOffset(5, 3)
-		ch.BackgroundColor3 = Color3.fromRGB(236, 146, 136)
-		ch.BackgroundTransparency = 0.45
-		ch.BorderSizePixel = 0
-		ch.ZIndex = 16
-		ch.Parent = head
-		local chc = Instance.new("UICorner")
-		chc.CornerRadius = UDim.new(1, 0)
-		chc.Parent = ch
-	end
-
-	-- Panic Sclera Rings (shown only during panic)
-	local function makeSclera(x)
-		local s = Instance.new("Frame")
-		s.AnchorPoint = Vector2.new(0.5, 0.5)
-		s.Position = UDim2.fromOffset(x, 12)
-		s.Size = UDim2.fromOffset(7, 8)
-		s.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-		s.BorderSizePixel = 0
-		s.Visible = false
-		s.ZIndex = 16
-		s.Parent = head
-		local sc = Instance.new("UICorner")
-		sc.CornerRadius = UDim.new(1, 0)
-		sc.Parent = s
-		return s
-	end
-	HUD.scleraL = makeSclera(9)
-	HUD.scleraR = makeSclera(19)
-
-	-- Expressive Eyes + Specular Catchlights
-	local function makeEye(x)
-		local e = Instance.new("Frame")
-		e.AnchorPoint = Vector2.new(0.5, 0.5)
-		e.Position = UDim2.fromOffset(x, 12)
-		e.Size = UDim2.fromOffset(5, 6)
-		e.BackgroundColor3 = Color3.fromRGB(28, 30, 38)
-		e.BorderSizePixel = 0
-		e.ZIndex = 17
-		e.Parent = head
-		local ec = Instance.new("UICorner")
-		ec.CornerRadius = UDim.new(1, 0)
-		ec.Parent = e
-
-		local sp = Instance.new("Frame")
-		sp.Position = UDim2.fromOffset(1, 1)
-		sp.Size = UDim2.fromOffset(2, 2)
-		sp.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
-		sp.BorderSizePixel = 0
-		sp.ZIndex = 18
-		sp.Parent = e
-		local spc = Instance.new("UICorner")
-		spc.CornerRadius = UDim.new(1, 0)
-		spc.Parent = sp
-		return e, sp
-	end
-	HUD.eyeL, HUD.sparkL = makeEye(9)
-	HUD.eyeR, HUD.sparkR = makeEye(19)
-
-	-- Expressive Eyebrows
-	local function makeBrow(x)
-		local b = Instance.new("Frame")
-		b.AnchorPoint = Vector2.new(0.5, 0.5)
-		b.Position = UDim2.fromOffset(x, 7)
-		b.Size = UDim2.fromOffset(6, 2)
-		b.BackgroundColor3 = Color3.fromRGB(76, 62, 52)
-		b.BorderSizePixel = 0
-		b.Visible = false
-		b.ZIndex = 18
-		b.Parent = head
-		local brc = Instance.new("UICorner")
-		brc.CornerRadius = UDim.new(1, 0)
-		brc.Parent = b
-		return b
-	end
-	HUD.browL = makeBrow(9)
-	HUD.browR = makeBrow(19)
-
-	-- Mouth + Inner Accent
-	local mouth = Instance.new("Frame")
-	mouth.Name = "Mouth"
-	mouth.AnchorPoint = Vector2.new(0.5, 0.5)
-	mouth.Position = UDim2.fromOffset(14, 19)
-	mouth.Size = UDim2.fromOffset(7, 3)
-	mouth.BackgroundColor3 = Color3.fromRGB(78, 52, 48)
-	mouth.BorderSizePixel = 0
-	mouth.ZIndex = 17
-	mouth.Parent = head
-	local mc = Instance.new("UICorner")
-	mc.CornerRadius = UDim.new(1, 0)
-	mc.Parent = mouth
-	HUD.mouth = mouth
-
-	local mInner = Instance.new("Frame")
-	mInner.AnchorPoint = Vector2.new(0.5, 1)
-	mInner.Position = UDim2.new(0.5, 0, 1, -1)
-	mInner.Size = UDim2.fromOffset(5, 2)
-	mInner.BackgroundColor3 = Color3.fromRGB(224, 118, 114)
-	mInner.BorderSizePixel = 0
-	mInner.Visible = false
-	mInner.ZIndex = 18
-	mInner.Parent = mouth
-	local mic = Instance.new("UICorner")
-	mic.CornerRadius = UDim.new(1, 0)
-	mic.Parent = mInner
-	HUD.mouthInner = mInner
-
-	-- Cool Sunglasses (Turbo / Engine Detected)
-	local shades = Instance.new("Frame")
-	shades.Name = "Shades"
-	shades.BackgroundTransparency = 1
-	shades.Position = UDim2.fromOffset(2, 9)
-	shades.Size = UDim2.fromOffset(24, 8)
-	shades.Visible = false
-	shades.ZIndex = 19
-	shades.Parent = head
-	HUD.shades = shades
-	for _, lx in ipairs({ 1, 13 }) do
-		local lens = Instance.new("Frame")
-		lens.Position = UDim2.fromOffset(lx, 0)
-		lens.Size = UDim2.fromOffset(10, 7)
-		lens.BackgroundColor3 = Color3.fromRGB(20, 22, 28)
-		lens.BorderSizePixel = 0
-		lens.ZIndex = 19
-		lens.Parent = shades
-		local lc = Instance.new("UICorner")
-		lc.CornerRadius = UDim.new(0, 2)
-		lc.Parent = lens
-		local glint = Instance.new("Frame")
-		glint.Position = UDim2.fromOffset(2, 1)
-		glint.Size = UDim2.fromOffset(4, 1)
-		glint.Rotation = -22
-		glint.BackgroundColor3 = Color3.fromRGB(220, 232, 250)
-		glint.BackgroundTransparency = 0.35
-		glint.BorderSizePixel = 0
-		glint.ZIndex = 20
-		glint.Parent = lens
-	end
-	local bridge = Instance.new("Frame")
-	bridge.Position = UDim2.fromOffset(10, 2)
-	bridge.Size = UDim2.fromOffset(4, 2)
-	bridge.BackgroundColor3 = Color3.fromRGB(20, 22, 28)
-	bridge.BorderSizePixel = 0
-	bridge.ZIndex = 19
-	bridge.Parent = shades
-
-	-- Panic Sweat Drop
-	local sweat = Instance.new("Frame")
-	sweat.Name = "Sweat"
-	sweat.Position = UDim2.fromOffset(39, 17)
-	sweat.Size = UDim2.fromOffset(4, 6)
-	sweat.BackgroundColor3 = Color3.fromRGB(110, 198, 250)
-	sweat.BorderSizePixel = 0
-	sweat.Visible = false
-	sweat.ZIndex = 19
-	sweat.Parent = rig
-	local swc = Instance.new("UICorner")
-	swc.CornerRadius = UDim.new(1, 0)
-	swc.Parent = sweat
-	HUD.sweat = sweat
-
-	-- Gold Crown Sparkle (Mate / Blunder)
-	local sparkle = Instance.new("Frame")
-	sparkle.Name = "Sparkle"
-	sparkle.Position = UDim2.fromOffset(38, 10)
-	sparkle.Size = UDim2.fromOffset(5, 5)
-	sparkle.Rotation = 45
-	sparkle.BackgroundColor3 = Color3.fromRGB(252, 224, 118)
-	sparkle.BorderSizePixel = 0
-	sparkle.Visible = false
-	sparkle.ZIndex = 19
-	sparkle.Parent = rig
-	HUD.sparkle = sparkle
-
-	-- Editorial Quote Accent Bar separating Portrait and Speech
-	local accentBar = Instance.new("Frame")
-	accentBar.Name = "QuoteAccent"
-	accentBar.Position = UDim2.fromOffset(69, 27)
-	accentBar.Size = UDim2.fromOffset(2, 33)
-	accentBar.BackgroundColor3 = Color3.fromRGB(98, 112, 134)
-	accentBar.BorderSizePixel = 0
-	accentBar.ZIndex = 13
-	accentBar.Parent = card
-	local abCorner = Instance.new("UICorner")
-	abCorner.CornerRadius = UDim.new(1, 0)
-	abCorner.Parent = accentBar
-	HUD.accentBar = accentBar
-
-	-- Top Row: Quiet Meta Info (Status Dot + Engine + Eval Pill + Subtle Drag Grip)
+	-- Top Meta Row: Status Dot + Crisp Engine Context + High-Contrast Eval Pill + Drag Grip
 	local dot = Instance.new("Frame")
 	dot.Name = "PulseDot"
 	dot.AnchorPoint = Vector2.new(0.5, 0.5)
-	dot.Position = UDim2.fromOffset(72, 15)
-	dot.Size = UDim2.fromOffset(6, 6)
-	dot.BackgroundColor3 = Color3.fromRGB(98, 112, 134)
+	dot.Position = UDim2.fromOffset(82, 18)
+	dot.Size = UDim2.fromOffset(7, 7)
+	dot.BackgroundColor3 = Color3.fromRGB(74, 127, 214)
 	dot.BorderSizePixel = 0
 	dot.ZIndex = 13
 	dot.Parent = card
@@ -3703,40 +3326,48 @@ do
 	local title = Instance.new("TextLabel")
 	title.Name = "EngineTitle"
 	title.BackgroundTransparency = 1
-	title.Position = UDim2.fromOffset(80, 6)
-	title.Size = UDim2.new(1, -162, 0, 18)
-	title.Font = Enum.Font.GothamMedium
-	title.TextSize = 11
+	title.Position = UDim2.fromOffset(92, 9)
+	title.Size = UDim2.new(1, -182, 0, 18)
+	title.FontFace = Font.fromEnum(Enum.Font.BuilderSansMedium)
+	title.TextSize = 12
 	title.TextXAlignment = Enum.TextXAlignment.Left
 	title.TextTruncate = Enum.TextTruncate.AtEnd
-	title.TextColor3 = Color3.fromRGB(152, 162, 182)
-	title.Text = "Stockfish 19 VPS · Ready"
+	title.TextColor3 = Color3.fromRGB(178, 182, 190)
+	title.Text = "Stockfish 19 · Ready"
 	title.ZIndex = 13
 	title.Parent = card
 	HUD.title = title
 
+	-- High-contrast Chess.com/Lichess Eval Pill
 	local evalPill = Instance.new("Frame")
 	evalPill.Name = "EvalPill"
 	evalPill.AnchorPoint = Vector2.new(1, 0)
-	evalPill.Position = UDim2.new(1, -24, 0, 6)
-	evalPill.Size = UDim2.fromOffset(54, 18)
-	evalPill.BackgroundColor3 = Color3.fromRGB(34, 38, 48)
+	evalPill.Position = UDim2.new(1, -28, 0, 8)
+	evalPill.Size = UDim2.fromOffset(58, 20)
+	evalPill.BackgroundColor3 = Color3.fromRGB(50, 52, 57)
 	evalPill.BorderSizePixel = 0
 	evalPill.ZIndex = 13
 	evalPill.Parent = card
 	local epCorner = Instance.new("UICorner")
-	epCorner.CornerRadius = UDim.new(0, 5)
+	epCorner.CornerRadius = UDim.new(0, 6)
 	epCorner.Parent = evalPill
+	local epStroke = Instance.new("UIStroke")
+	epStroke.Color = Color3.fromRGB(74, 78, 88)
+	epStroke.Thickness = 1
+	epStroke.Transparency = 0.35
+	epStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	epStroke.Parent = evalPill
 	HUD.evalPill = evalPill
+	HUD.evalStroke = epStroke
 
 	local evalText = Instance.new("TextLabel")
 	evalText.Name = "EvalText"
 	evalText.BackgroundTransparency = 1
 	evalText.Size = UDim2.fromScale(1, 1)
-	evalText.Font = Enum.Font.RobotoMono
-	evalText.TextSize = 11
-	evalText.TextColor3 = Color3.fromRGB(232, 236, 244)
-	evalText.Text = "0.00"
+	evalText.FontFace = Font.new(Font.fromEnum(Enum.Font.RobotoMono).Family, Enum.FontWeight.Bold)
+	evalText.TextSize = 12
+	evalText.TextColor3 = Color3.fromRGB(243, 244, 246)
+	evalText.Text = "0.0"
 	evalText.ZIndex = 14
 	evalText.Parent = evalPill
 	HUD.evalText = evalText
@@ -3745,44 +3376,45 @@ do
 	grip.Name = "Grip"
 	grip.BackgroundTransparency = 1
 	grip.AnchorPoint = Vector2.new(1, 0)
-	grip.Position = UDim2.new(1, -7, 0, 5)
-	grip.Size = UDim2.fromOffset(14, 18)
-	grip.Font = Enum.Font.GothamBold
-	grip.TextSize = 12
-	grip.TextColor3 = Color3.fromRGB(84, 92, 110)
+	grip.Position = UDim2.new(1, -9, 0, 8)
+	grip.Size = UDim2.fromOffset(14, 19)
+	grip.FontFace = Font.fromEnum(Enum.Font.BuilderSansBold)
+	grip.TextSize = 13
+	grip.TextColor3 = Color3.fromRGB(108, 114, 126)
 	grip.Text = "⋮⋮"
 	grip.ZIndex = 13
 	grip.Parent = card
 	HUD.grip = grip
 
-	-- Main Row: Coach Commentary (Crisp 2-line wrapped speech)
+	-- Main Coach Dialogue (BuilderSans 14px, generous right padding — never clips!)
 	local fyiText = Instance.new("TextLabel")
 	fyiText.Name = "CoachSpeech"
 	fyiText.BackgroundTransparency = 1
-	fyiText.Position = UDim2.fromOffset(78, 26)
-	fyiText.Size = UDim2.new(1, -88, 0, 38)
-	fyiText.Font = Enum.Font.GothamMedium
-	fyiText.TextSize = 13
-	fyiText.LineHeight = 1.12
+	fyiText.Position = UDim2.fromOffset(79, 31)
+	fyiText.Size = UDim2.new(1, -95, 0, 38)
+	fyiText.FontFace = Font.fromEnum(Enum.Font.BuilderSansMedium)
+	fyiText.TextSize = 14
+	fyiText.LineHeight = 1.14
 	fyiText.TextWrapped = true
 	fyiText.TextXAlignment = Enum.TextXAlignment.Left
 	fyiText.TextYAlignment = Enum.TextYAlignment.Top
-	fyiText.TextColor3 = Color3.fromRGB(236, 240, 248)
-	fyiText.Text = "Siap nemenin main. Kartu ini bisa di-drag bebas (double-click reset)."
+	fyiText.TextColor3 = Color3.fromRGB(243, 244, 246)
+	fyiText.Text = "Siap nemenin main. Kartu ini bisa di-drag (double-click reset)."
 	fyiText.ZIndex = 13
 	fyiText.Parent = card
 	HUD.fyiText = fyiText
 
 	applyCoachMood("calm")
+	preloadCoachAvatars()
 
-	-- Subtle hover brighten on drag grip
-	trackConn(card.MouseEnter:Connect(function()
+	-- Subtle hover feedback on grip
+	trackConn(wrap.MouseEnter:Connect(function()
 		HUD.hovered = true
-		if HUD.grip then HUD.grip.TextColor3 = Color3.fromRGB(162, 172, 194) end
+		if HUD.grip then HUD.grip.TextColor3 = Color3.fromRGB(196, 202, 214) end
 	end))
-	trackConn(card.MouseLeave:Connect(function()
+	trackConn(wrap.MouseLeave:Connect(function()
 		HUD.hovered = false
-		if HUD.grip then HUD.grip.TextColor3 = Color3.fromRGB(84, 92, 110) end
+		if HUD.grip then HUD.grip.TextColor3 = Color3.fromRGB(108, 114, 126) end
 	end))
 
 	-- Smooth drag + double-click reset (clamped inside screen bounds)
@@ -3790,13 +3422,13 @@ do
 	local dragStartPos = nil
 	local movedDuringDrag = false
 
-	trackConn(card.InputBegan:Connect(function(input)
+	trackConn(wrap.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 			local now = os.clock()
 			if (now - HUD.lastClickAt) <= 0.32 and not movedDuringDrag then
 				HUD.customPos = false
-				card.AnchorPoint = Vector2.new(0.5, 0)
-				card.Position = UDim2.new(0.5, 0, 0, 10)
+				wrap.AnchorPoint = Vector2.new(0.5, 0)
+				wrap.Position = UDim2.new(0.5, 0, 0, 10)
 				HUD.lastClickAt = 0
 				return
 			end
@@ -3804,9 +3436,9 @@ do
 			HUD.dragging = true
 			movedDuringDrag = false
 			dragStartMouse = Vector2.new(input.Position.X, input.Position.Y)
-			local absPos = card.AbsolutePosition
-			card.AnchorPoint = Vector2.new(0, 0)
-			card.Position = UDim2.fromOffset(absPos.X, absPos.Y)
+			local absPos = wrap.AbsolutePosition
+			wrap.AnchorPoint = Vector2.new(0, 0)
+			wrap.Position = UDim2.fromOffset(absPos.X, absPos.Y)
 			dragStartPos = absPos
 		end
 	end))
@@ -3824,11 +3456,11 @@ do
 			local cam = workspace.CurrentCamera
 			local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
 			local inset = GuiService:GetGuiInset()
-			local maxX = math.max(8, vp.X - card.AbsoluteSize.X - 8)
-			local maxY = math.max(8, vp.Y - inset.Y - card.AbsoluteSize.Y - 8)
+			local maxX = math.max(8, vp.X - wrap.AbsoluteSize.X - 8)
+			local maxY = math.max(8, vp.Y - inset.Y - wrap.AbsoluteSize.Y - 8)
 			local nx = math.clamp(dragStartPos.X + delta.X, 8, maxX)
 			local ny = math.clamp(dragStartPos.Y + delta.Y, 6, maxY)
-			card.Position = UDim2.fromOffset(nx, ny)
+			wrap.Position = UDim2.fromOffset(nx, ny)
 		end
 	end))
 
@@ -3839,7 +3471,7 @@ do
 	end))
 end
 
--- Broadcast-Grade Vertical Eval & Win-Chance Bar docked left of board (clean FIDE / Lichess style)
+-- Broadcast-Grade Vertical Eval & Win-Chance Bar docked left of board (RoChess-native + viewport-clamped)
 local EVALBAR = {
 	frame = nil,
 	whiteFill = nil,
@@ -3851,11 +3483,14 @@ local EVALBAR = {
 	tipTop = nil,
 	tipSub = nil,
 	hovered = false,
+	lastAtBottom = true,
+	lastVisTop = 0,
+	lastVisBot = 600,
 }
 do
 	local bar = Instance.new("Frame")
 	bar.Name = "EvalBar"
-	bar.BackgroundColor3 = Color3.fromRGB(28, 30, 36)
+	bar.BackgroundColor3 = Color3.fromRGB(36, 38, 42)
 	bar.BorderSizePixel = 0
 	bar.ClipsDescendants = true
 	bar.Visible = false
@@ -3867,14 +3502,14 @@ do
 	c.CornerRadius = UDim.new(0, 6)
 	c.Parent = bar
 	local st = Instance.new("UIStroke")
-	st.Color = Color3.fromRGB(60, 65, 78)
+	st.Color = Color3.fromRGB(64, 68, 76)
 	st.Thickness = 1
 	st.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
 	st.Parent = bar
 
 	local wf = Instance.new("Frame")
 	wf.Name = "WhiteFill"
-	wf.BackgroundColor3 = Color3.fromRGB(238, 236, 229)
+	wf.BackgroundColor3 = Color3.fromRGB(240, 239, 234)
 	wf.BorderSizePixel = 0
 	wf.AnchorPoint = Vector2.new(0, 1)
 	wf.Position = UDim2.fromScale(0, 1)
@@ -3883,121 +3518,117 @@ do
 	wf.Parent = bar
 	EVALBAR.whiteFill = wf
 
-	-- Crisp 2px advantage horizon line tracking exact White/Black boundary
+	-- Crisp 2px advantage horizon line tracking White/Black balance
 	local horizon = Instance.new("Frame")
 	horizon.Name = "Horizon"
 	horizon.AnchorPoint = Vector2.new(0, 0.5)
 	horizon.Position = UDim2.fromScale(0, 0.5)
 	horizon.Size = UDim2.new(1, 0, 0, 2)
-	horizon.BackgroundColor3 = Color3.fromRGB(122, 128, 144)
+	horizon.BackgroundColor3 = Color3.fromRGB(118, 124, 138)
 	horizon.BorderSizePixel = 0
 	horizon.ZIndex = 9
 	horizon.Parent = bar
 	EVALBAR.horizon = horizon
 
-	-- Subtle broadcast scale ticks (50% equilibrium notch on both sides + 25%/75% micro-ticks)
-	local function addTick(yScale, xAnchor, xScale, wPx, alpha)
+	-- Subtle 50% equilibrium notch (left + right)
+	for _, xSpec in ipairs({ { 0, 0 }, { 1, 1 } }) do
 		local tk = Instance.new("Frame")
-		tk.AnchorPoint = Vector2.new(xAnchor, 0.5)
-		tk.Position = UDim2.fromScale(xScale, yScale)
-		tk.Size = UDim2.fromOffset(wPx, 1)
-		tk.BackgroundColor3 = Color3.fromRGB(132, 138, 154)
-		tk.BackgroundTransparency = alpha
+		tk.AnchorPoint = Vector2.new(xSpec[1], 0.5)
+		tk.Position = UDim2.fromScale(xSpec[2], 0.50)
+		tk.Size = UDim2.fromOffset(5, 1)
+		tk.BackgroundColor3 = Color3.fromRGB(130, 136, 150)
+		tk.BackgroundTransparency = 0.25
 		tk.BorderSizePixel = 0
 		tk.ZIndex = 8
 		tk.Parent = bar
 	end
-	addTick(0.50, 0, 0, 6, 0.22)
-	addTick(0.50, 1, 1, 6, 0.22)
-	addTick(0.25, 0, 0, 3, 0.55)
-	addTick(0.75, 0, 0, 3, 0.55)
 
-	-- Winning-side primary Eval Score (e.g. "+1.8", "M3", "0.0")
+	-- Winning-side primary Eval Score (viewport-clamped so never clipped off-screen!)
 	local scoreLbl = Instance.new("TextLabel")
 	scoreLbl.Name = "EvalScore"
 	scoreLbl.BackgroundTransparency = 1
 	scoreLbl.Size = UDim2.new(1, 0, 0, 15)
 	scoreLbl.AnchorPoint = Vector2.new(0, 1)
 	scoreLbl.Position = UDim2.new(0, 0, 1, -4)
-	scoreLbl.Font = Enum.Font.GothamBold
+	scoreLbl.FontFace = Font.fromEnum(Enum.Font.BuilderSansBold)
 	scoreLbl.TextSize = 11
-	scoreLbl.TextColor3 = Color3.fromRGB(22, 24, 30)
+	scoreLbl.TextColor3 = Color3.fromRGB(24, 26, 32)
 	scoreLbl.Text = "0.0"
 	scoreLbl.ZIndex = 10
 	scoreLbl.Parent = bar
 	EVALBAR.scoreLabel = scoreLbl
 
-	-- Winning-side secondary Win-Chance % (e.g. "68%", "50%", "WIN")
+	-- Winning-side secondary Win-Chance %
 	local pctLbl = Instance.new("TextLabel")
 	pctLbl.Name = "WinPct"
 	pctLbl.BackgroundTransparency = 1
-	pctLbl.Size = UDim2.new(1, 0, 0, 13)
+	pctLbl.Size = UDim2.new(1, 0, 0, 12)
 	pctLbl.AnchorPoint = Vector2.new(0, 1)
-	pctLbl.Position = UDim2.new(0, 0, 1, -19)
-	pctLbl.Font = Enum.Font.RobotoMono
-	pctLbl.TextSize = 10
-	pctLbl.TextColor3 = Color3.fromRGB(78, 84, 98)
+	pctLbl.Position = UDim2.new(0, 0, 1, -18)
+	pctLbl.FontFace = Font.new(Font.fromEnum(Enum.Font.RobotoMono).Family, Enum.FontWeight.Bold)
+	pctLbl.TextSize = 9
+	pctLbl.TextColor3 = Color3.fromRGB(82, 86, 98)
 	pctLbl.Text = "50%"
 	pctLbl.ZIndex = 10
 	pctLbl.Parent = bar
 	EVALBAR.winPctLabel = pctLbl
 
-	-- Losing-side subtle remaining Win-Chance % (hidden automatically when <18% height)
+	-- Opposite-end subtle remaining Win % (hidden when trailing region <20%)
 	local oppLbl = Instance.new("TextLabel")
 	oppLbl.Name = "OppPct"
 	oppLbl.BackgroundTransparency = 1
-	oppLbl.Size = UDim2.new(1, 0, 0, 13)
+	oppLbl.Size = UDim2.new(1, 0, 0, 12)
 	oppLbl.AnchorPoint = Vector2.new(0, 0)
 	oppLbl.Position = UDim2.new(0, 0, 0, 4)
-	oppLbl.Font = Enum.Font.RobotoMono
+	oppLbl.FontFace = Font.new(Font.fromEnum(Enum.Font.RobotoMono).Family, Enum.FontWeight.Medium)
 	oppLbl.TextSize = 9
-	oppLbl.TextColor3 = Color3.fromRGB(168, 174, 188)
+	oppLbl.TextColor3 = Color3.fromRGB(168, 174, 186)
 	oppLbl.Text = "50%"
 	oppLbl.ZIndex = 10
 	oppLbl.Parent = bar
 	EVALBAR.oppPctLabel = oppLbl
 
-	-- Clean Hover Breakdown Card (only visible when hovering Eval Bar)
+	-- RoChess-native Hover Breakdown Card
 	local tip = Instance.new("Frame")
 	tip.Name = "EvalTooltip"
-	tip.Size = UDim2.fromOffset(176, 38)
-	tip.BackgroundColor3 = Color3.fromRGB(22, 24, 31)
-	tip.BackgroundTransparency = 0.04
+	tip.Size = UDim2.fromOffset(182, 42)
+	tip.BackgroundColor3 = Color3.fromRGB(36, 38, 42)
+	tip.BackgroundTransparency = 0.02
 	tip.BorderSizePixel = 0
 	tip.Visible = false
 	tip.ZIndex = 16
 	tip.Parent = overlayGui
 	local tc = Instance.new("UICorner")
-	tc.CornerRadius = UDim.new(0, 8)
+	tc.CornerRadius = UDim.new(0, 10)
 	tc.Parent = tip
 	local tst = Instance.new("UIStroke")
-	tst.Color = Color3.fromRGB(60, 66, 80)
+	tst.Color = Color3.fromRGB(64, 68, 76)
 	tst.Thickness = 1
 	tst.Parent = tip
 	EVALBAR.tooltip = tip
 
 	local tipTop = Instance.new("TextLabel")
 	tipTop.BackgroundTransparency = 1
-	tipTop.Position = UDim2.fromOffset(9, 4)
-	tipTop.Size = UDim2.new(1, -18, 0, 15)
-	tipTop.Font = Enum.Font.GothamBold
-	tipTop.TextSize = 11
+	tipTop.Position = UDim2.fromOffset(10, 5)
+	tipTop.Size = UDim2.new(1, -20, 0, 16)
+	tipTop.FontFace = Font.fromEnum(Enum.Font.BuilderSansBold)
+	tipTop.TextSize = 12
 	tipTop.TextXAlignment = Enum.TextXAlignment.Left
-	tipTop.TextColor3 = Color3.fromRGB(238, 240, 246)
-	tipTop.Text = "White 50%  ·  Black 50%"
+	tipTop.TextColor3 = Color3.fromRGB(243, 244, 246)
+	tipTop.Text = "Putih 50%  ·  Hitam 50%"
 	tipTop.ZIndex = 17
 	tipTop.Parent = tip
 	EVALBAR.tipTop = tipTop
 
 	local tipSub = Instance.new("TextLabel")
 	tipSub.BackgroundTransparency = 1
-	tipSub.Position = UDim2.fromOffset(9, 19)
-	tipSub.Size = UDim2.new(1, -18, 0, 14)
-	tipSub.Font = Enum.Font.RobotoMono
-	tipSub.TextSize = 10
+	tipSub.Position = UDim2.fromOffset(10, 22)
+	tipSub.Size = UDim2.new(1, -20, 0, 14)
+	tipSub.FontFace = Font.fromEnum(Enum.Font.BuilderSansMedium)
+	tipSub.TextSize = 11
 	tipSub.TextXAlignment = Enum.TextXAlignment.Left
-	tipSub.TextColor3 = Color3.fromRGB(154, 162, 180)
-	tipSub.Text = "Eval 0.00 (Seimbang)"
+	tipSub.TextColor3 = Color3.fromRGB(178, 182, 190)
+	tipSub.Text = "Eval 0.00 · Seimbang"
 	tipSub.ZIndex = 17
 	tipSub.Parent = tip
 	EVALBAR.tipSub = tipSub
@@ -4168,6 +3799,29 @@ local function formatEvalText(cp, mate)
 	return "0.00"
 end
 
+local function positionEvalBarLabels(atBottom, visTop, visBot)
+	if not EVALBAR.scoreLabel then
+		return
+	end
+	local topY = math.max(4, math.floor((visTop or 0) + 4))
+	local botY = math.max(topY + 34, math.floor((visBot or 400) - 4))
+	if atBottom then
+		EVALBAR.scoreLabel.AnchorPoint = Vector2.new(0, 1)
+		EVALBAR.scoreLabel.Position = UDim2.fromOffset(0, botY)
+		EVALBAR.winPctLabel.AnchorPoint = Vector2.new(0, 1)
+		EVALBAR.winPctLabel.Position = UDim2.fromOffset(0, botY - 14)
+		EVALBAR.oppPctLabel.AnchorPoint = Vector2.new(0, 0)
+		EVALBAR.oppPctLabel.Position = UDim2.fromOffset(0, topY)
+	else
+		EVALBAR.scoreLabel.AnchorPoint = Vector2.new(0, 0)
+		EVALBAR.scoreLabel.Position = UDim2.fromOffset(0, topY)
+		EVALBAR.winPctLabel.AnchorPoint = Vector2.new(0, 0)
+		EVALBAR.winPctLabel.Position = UDim2.fromOffset(0, topY + 14)
+		EVALBAR.oppPctLabel.AnchorPoint = Vector2.new(0, 1)
+		EVALBAR.oppPctLabel.Position = UDim2.fromOffset(0, botY)
+	end
+end
+
 local function updateEvalBarVisual(cp, mate, flipped)
 	if not EVALBAR.frame then
 		return
@@ -4184,20 +3838,19 @@ local function updateEvalBarVisual(cp, mate, flipped)
 		whiteFrac = math.clamp(whiteWinPct / 100, 0.035, 0.965)
 	end
 
-	local ti = TweenInfo.new(0.30, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+	local ti = TweenInfo.new(0.28, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
 	EVALBAR.whiteFill.AnchorPoint = flipped and Vector2.new(0, 0) or Vector2.new(0, 1)
 	EVALBAR.whiteFill.Position = flipped and UDim2.fromScale(0, 0) or UDim2.fromScale(0, 1)
 	TweenService:Create(EVALBAR.whiteFill, ti, {
 		Size = UDim2.fromScale(1, whiteFrac),
 	}):Play()
 
-	-- Horizon line tracks exact boundary between White & Black fill
 	local horizonY = flipped and whiteFrac or (1 - whiteFrac)
 	local absCp = math.abs(cp or 0)
-	local horizonCol = isMate and Color3.fromRGB(240, 196, 78)
+	local horizonCol = isMate and Color3.fromRGB(242, 190, 66)
 		or (absCp >= 300 and Color3.fromRGB(224, 178, 72))
-		or (absCp >= 80 and Color3.fromRGB(72, 188, 138))
-		or Color3.fromRGB(122, 128, 144)
+		or (absCp >= 80 and Color3.fromRGB(46, 196, 182))
+		or Color3.fromRGB(118, 124, 138)
 	TweenService:Create(EVALBAR.horizon, ti, {
 		Position = UDim2.fromScale(0, horizonY),
 		BackgroundColor3 = horizonCol,
@@ -4205,20 +3858,15 @@ local function updateEvalBarVisual(cp, mate, flipped)
 
 	local whiteBetter = isMate and (mate > 0) or ((cp or 0) >= 0)
 	local atBottom = (whiteBetter and not flipped) or ((not whiteBetter) and flipped)
+	EVALBAR.lastAtBottom = atBottom
+	positionEvalBarLabels(atBottom, EVALBAR.lastVisTop, EVALBAR.lastVisBot)
 
-	-- Place primary Score + Win % comfortably inside the winning (>=50%) half
-	EVALBAR.scoreLabel.AnchorPoint = atBottom and Vector2.new(0, 1) or Vector2.new(0, 0)
-	EVALBAR.scoreLabel.Position = atBottom and UDim2.new(0, 0, 1, -4) or UDim2.new(0, 0, 0, 4)
-	EVALBAR.winPctLabel.AnchorPoint = atBottom and Vector2.new(0, 1) or Vector2.new(0, 0)
-	EVALBAR.winPctLabel.Position = atBottom and UDim2.new(0, 0, 1, -19) or UDim2.new(0, 0, 0, 19)
-
-	-- High-contrast classic chess ivory / obsidian text palette
 	if isMate then
-		EVALBAR.scoreLabel.TextColor3 = whiteBetter and Color3.fromRGB(146, 98, 10) or Color3.fromRGB(248, 206, 88)
+		EVALBAR.scoreLabel.TextColor3 = whiteBetter and Color3.fromRGB(146, 98, 10) or Color3.fromRGB(242, 190, 66)
 	else
-		EVALBAR.scoreLabel.TextColor3 = whiteBetter and Color3.fromRGB(20, 22, 28) or Color3.fromRGB(242, 240, 234)
+		EVALBAR.scoreLabel.TextColor3 = whiteBetter and Color3.fromRGB(24, 26, 32) or Color3.fromRGB(243, 244, 246)
 	end
-	EVALBAR.winPctLabel.TextColor3 = whiteBetter and Color3.fromRGB(82, 88, 102) or Color3.fromRGB(168, 174, 190)
+	EVALBAR.winPctLabel.TextColor3 = whiteBetter and Color3.fromRGB(82, 86, 98) or Color3.fromRGB(178, 182, 190)
 
 	local wPctInt = math.clamp(math.floor(whiteWinPct + 0.5), 0, 100)
 	local bPctInt = 100 - wPctInt
@@ -4240,17 +3888,13 @@ local function updateEvalBarVisual(cp, mate, flipped)
 		EVALBAR.winPctLabel.Text = tostring(leadPct) .. "%"
 	end
 
-	-- Opposite-end subtle % only when the trailing region has >=18% vertical breathing room
 	local trailingFrac = whiteBetter and (1 - whiteFrac) or whiteFrac
-	EVALBAR.oppPctLabel.Visible = (not isMate) and (trailingFrac >= 0.18)
+	EVALBAR.oppPctLabel.Visible = (not isMate) and (trailingFrac >= 0.20)
 	if EVALBAR.oppPctLabel.Visible then
-		EVALBAR.oppPctLabel.AnchorPoint = atBottom and Vector2.new(0, 0) or Vector2.new(0, 1)
-		EVALBAR.oppPctLabel.Position = atBottom and UDim2.new(0, 0, 0, 4) or UDim2.new(0, 0, 1, -4)
-		EVALBAR.oppPctLabel.TextColor3 = whiteBetter and Color3.fromRGB(156, 162, 178) or Color3.fromRGB(92, 96, 110)
+		EVALBAR.oppPctLabel.TextColor3 = whiteBetter and Color3.fromRGB(168, 174, 186) or Color3.fromRGB(92, 96, 110)
 		EVALBAR.oppPctLabel.Text = tostring(trailPct) .. "%"
 	end
 
-	-- Keep hover breakdown tooltip synchronized
 	if EVALBAR.tipTop and EVALBAR.tipSub then
 		EVALBAR.tipTop.Text = string.format("Putih %d%%  ·  Hitam %d%%", wPctInt, bPctInt)
 		if isMate then
@@ -4260,7 +3904,7 @@ local function updateEvalBarVisual(cp, mate, flipped)
 				or (absCp < 160 and "Unggul tipis")
 				or (absCp < 350 and "Unggul jelas")
 				or "Menang telak"
-			EVALBAR.tipSub.Text = string.format("Eval %s (%s)", formatEvalText(cp, nil), tone)
+			EVALBAR.tipSub.Text = string.format("Eval %s · %s", formatEvalText(cp, nil), tone)
 		end
 	end
 end
@@ -4414,7 +4058,9 @@ local function syncConfigFromUI()
 	end
 	CONFIG.OnlyMyTurn = (Toggles.OnlyMyTurn == nil) or (Toggles.OnlyMyTurn.Value == true)
 	CONFIG.AntiEngineTurbo = (Toggles.AntiEngineTurbo == nil) or (Toggles.AntiEngineTurbo.Value == true)
+	CONFIG.PauseTurboOnSpectate = (Toggles.PauseTurboOnSpectate == nil) or (Toggles.PauseTurboOnSpectate.Value == true)
 	CONFIG.AutoPlay = (Toggles.AutoPlay ~= nil) and (Toggles.AutoPlay.Value == true)
+	CONFIG.AutoNextPuzzle = (Toggles.AutoNextPuzzle ~= nil) and (Toggles.AutoNextPuzzle.Value == true)
 	if Options.AutoDelayMin and tonumber(Options.AutoDelayMin.Value) then
 		CONFIG.AutoDelayMin = math.clamp(tonumber(Options.AutoDelayMin.Value), 0.2, 5.0)
 	end
@@ -4533,6 +4179,12 @@ AssistBox:AddSlider("AutoDelayMax", {
 	Tooltip = "Maximum random delay before playing a move.",
 })
 
+AssistBox:AddToggle("AutoNextPuzzle", {
+	Text = "Auto Next Puzzle",
+	Default = false,
+	Tooltip = "Automatically clicks Next with a short natural pause once a puzzle is finished.",
+})
+
 AssistBox:AddToggle("AutoFindMatch", {
 	Text = "Auto Find Match",
 	Default = false,
@@ -4588,7 +4240,13 @@ AnalysisBox:AddDropdown("PlayStyle", {
 AnalysisBox:AddToggle("AntiEngineTurbo", {
 	Text = "Anti-Engine Turbo",
 	Default = true,
-	Tooltip = "Detects engine opponents early via Stockfish agreement & cadence, prefetches ponder replies during their turn (0ms), and switches to fast pacing when matched or down on time.",
+	Tooltip = "Detects engine opponents early via Stockfish agreement & cadence, prefetches ponder replies (0ms), and speeds up under pressure.",
+})
+
+AnalysisBox:AddToggle("PauseTurboOnSpectate", {
+	Text = "Pause Turbo on Spectate",
+	Default = true,
+	Tooltip = "Automatically pauses Turbo Mode while anyone is spectating your match, then resumes once spectators leave.",
 })
 
 AnalysisBox:AddToggle("OnlyMyTurn", {
@@ -4891,10 +4549,23 @@ Toggles.AntiEngineTurbo:OnChanged(function()
 	if not CONFIG.AntiEngineTurbo then
 		STATE.Opp.turboActive = false
 		STATE.Opp.turboReason = nil
+		STATE.Opp.spectatorPaused = false
 		STATE.Opp.suspect = false
 		cancelPrefetchState()
 	end
 	scheduleRecalc()
+end)
+Toggles.PauseTurboOnSpectate:OnChanged(function()
+	syncConfigFromUI()
+	if STATE.App and STATE.App.session then
+		scheduleRecalc()
+	end
+end)
+Toggles.AutoNextPuzzle:OnChanged(function(val)
+	syncConfigFromUI()
+	if val then
+		STATE.PuzzleNextClickAt = 0
+	end
 end)
 Toggles.AutoPlay:OnChanged(function(val)
 	syncConfigFromUI()
@@ -5282,7 +4953,7 @@ local function computeSmartAutoDelay(session, res)
 		and not isOpening
 		and not isForcedMate
 		and not suspect
-		and not STATE.Opp.engineDetected
+		and not (STATE.Opp.engineDetected and not STATE.Opp.spectatorPaused)
 	then
 		local mySec = msLeft / 1000
 		local oppSec = oppMsLeft / 1000
@@ -5721,13 +5392,27 @@ local function renderOverlay()
 	-- Broadcast Eval & Win-Chance Bar (hide if game's native evalBar is already shown)
 	local nativeEvalOn = app.evalBar and app.evalBar.Visible
 	if CONFIG.ShowEvalBar and not nativeEvalOn and EVALBAR.frame then
-		local barW = (pos.X >= 46) and 34 or 28
-		local barX = math.max(4, pos.X - barW - 8)
+		local barW = (pos.X >= 38) and 28 or 24
+		local barX = math.max(4, pos.X - barW - 6)
 		EVALBAR.frame.Visible = true
 		EVALBAR.frame.Size = UDim2.fromOffset(barW, sz.Y)
 		EVALBAR.frame.Position = UDim2.fromOffset(barX, pos.Y)
+
+		-- Clamp score/win% inside visible screen bounds so tall/bottom-clipped boards stay 100% readable
+		local cam = workspace.CurrentCamera
+		local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+		local inset = GuiService:GetGuiInset()
+		local visTop = math.max(0, -pos.Y)
+		local visBot = math.min(sz.Y, vp.Y - inset.Y - pos.Y)
+		if math.abs(visTop - EVALBAR.lastVisTop) >= 2 or math.abs(visBot - EVALBAR.lastVisBot) >= 2 then
+			EVALBAR.lastVisTop = visTop
+			EVALBAR.lastVisBot = visBot
+			positionEvalBarLabels(EVALBAR.lastAtBottom, visTop, visBot)
+		end
+
 		if EVALBAR.tooltip then
-			EVALBAR.tooltip.Position = UDim2.fromOffset(barX + barW + 8, pos.Y + math.max(0, math.floor(sz.Y * 0.5 - 19)))
+			local tipY = math.clamp(pos.Y + math.floor((visTop + visBot) * 0.5) - 21, 8, math.max(8, vp.Y - inset.Y - 50))
+			EVALBAR.tooltip.Position = UDim2.fromOffset(barX + barW + 8, tipY)
 			EVALBAR.tooltip.Visible = EVALBAR.hovered
 		end
 		if STATE.LastEvalFlip ~= flipped then
@@ -5886,45 +5571,55 @@ local function computeLiveFyi(sess, res, thinking)
 		end
 	end
 
-	-- 4. Anti-Engine Turbo & Suspect Alerts
+	-- 4. Spectator Turbo Pause & Anti-Engine Turbo / Suspect Alerts
 	if CONFIG.AntiEngineTurbo and sess.kind == "online" then
-		if o.engineDetected then
-			return "cool", string.format("Lawan bau-bau engine (%d%% · %d/%d). Pakai kacamata item, Full SF19 + Turbo!", o.suspicion, o.hits, o.checked), BADGE_COLORS.turbo
+		if o.spectatorPaused and (o.spectators or 0) > 0 then
+			return "mischief", string.format("Ada %d penonton — Turbo dipause dulu sampai sepi.", o.spectators), BADGE_COLORS.fallback
+		elseif o.engineDetected and o.turboActive then
+			return "cool", string.format("Lawan bau engine (%d%%) — kacamata item, Full SF19!", o.suspicion), BADGE_COLORS.turbo
 		elseif o.turboActive then
-			return "cool", "Tekanan jam mulai tinggi — gas mode Turbo ngebut otomatis.", BADGE_COLORS.turbo
+			return "cool", "Jam mulai mepet — mode Turbo ngebut otomatis.", BADGE_COLORS.turbo
 		elseif o.suspect then
-			return "thinking", string.format("Lawan mainnya tajam banget (%d%%), aku naikin tempo dikit.", o.suspicion), BADGE_COLORS.suspect
+			return "thinking", string.format("Lawan main tajam banget (%d%%), tempo dinaikin.", o.suspicion), BADGE_COLORS.suspect
 		end
+	end
+
+	-- 4b. Puzzle Finished / Auto Next Puzzle
+	if sess.kind == "puzzle" and sess.pz and sess.pz.done then
+		if CONFIG.AutoNextPuzzle then
+			return "hyped", "Puzzle beres! Otomatis lanjut ke puzzle berikutnya...", BADGE_COLORS.puzzle
+		end
+		return "hyped", "Mantap, puzzle selesai! Klik Next buat lanjut.", BADGE_COLORS.puzzle
 	end
 
 	-- 5. Tactical Highlights (Blunder, Ponder Hit, Promo, Sharp Only-Move, Auto-Adapt)
 	if res then
 		if res.evalSwing and res.evalSwing >= 200 and myEval >= 150 then
-			return "smug", string.format("Waduh lawan blunder! Langsung hukum pakai %s (+%.1f).", res.san or res.best, myEval / 100), BADGE_COLORS.gm
+			return "smug", string.format("Lawan blunder! Hukum pakai %s (+%.1f).", res.san or res.best, myEval / 100), BADGE_COLORS.gm
 		end
 		if res.prefetched and (res.ms or 0) <= 5 then
-			return "smug", "Ponder Hit 0ms! Balasan lawan udah ketebak dari tadi.", BADGE_COLORS.vpssf
+			return "smug", "Ponder Hit 0ms! Balasan lawan udah ketebak.", BADGE_COLORS.vpssf
 		end
 		if res.promoChar then
-			return "hyped", string.format("Pion nyampe ujung — langsung promosi jadi =%s!", res.promoChar), BADGE_COLORS.mate
+			return "hyped", string.format("Pion nyampe ujung — langsung promosi =%s!", res.promoChar), BADGE_COLORS.mate
 		end
 		if res.pvGapCp and res.pvGapCp >= 110 and not res.isCapture then
-			return "thinking", string.format("Posisi tajam! Cuma %s yang kuat (+%.1f bedanya).", res.san or res.best, res.pvGapCp / 100), BADGE_COLORS.mate
+			return "thinking", string.format("Posisi tajam! Cuma %s yang kuat (+%.1f).", res.san or res.best, res.pvGapCp / 100), BADGE_COLORS.mate
 		end
 		if res.isAdapted and res.effStyle then
-			return "cool", string.format("Lawan lumayan alot — mode otomatis naik ke %s.", res.effStyle), BADGE_COLORS.vpssf
+			return "cool", string.format("Lawan alot — engine otomatis naik ke %s.", res.effStyle), BADGE_COLORS.vpssf
 		end
 	end
 
 	-- 6. Draw / 50-Move / Tight Endgame Warnings
 	if halfmove >= 60 then
-		return "draw", string.format("Hati-hati aturan 50 langkah (%d/100) — bentar lagi bisa remis.", halfmove), BADGE_COLORS.fallback
+		return "draw", string.format("Awas aturan 50 langkah (%d/100) — bisa remis.", halfmove), BADGE_COLORS.fallback
 	elseif totalPieces <= 4 and math.abs(myEval) <= 35 then
-		return "draw", "Bidak tinggal sedikit dan seri — bau-bau draw kuat banget.", BADGE_COLORS.fallback
+		return "draw", "Bidak sisa dikit dan seri — bau-bau draw kuat.", BADGE_COLORS.fallback
 	elseif totalPieces <= 10 and math.abs(myEval) <= 25 then
-		return "draw", string.format("Endgame ketat (%d bidak) — potensi remis atau adu tempo jam.", totalPieces), BADGE_COLORS.fallback
+		return "draw", string.format("Endgame ketat (%d bidak) — adu tempo & presisi.", totalPieces), BADGE_COLORS.fallback
 	elseif ply >= 40 and math.abs(myEval) <= 18 then
-		return "draw", "Posisi masih buntu dan seimbang banget, peluang draw tinggi.", BADGE_COLORS.fallback
+		return "draw", "Posisi masih buntu & seimbang, peluang draw tinggi.", BADGE_COLORS.fallback
 	end
 
 	-- 7. Clock Drama Alerts (Online)
@@ -5935,40 +5630,43 @@ local function computeLiveFyi(sess, res, thinking)
 			local mySec = myMs / 1000
 			local oppSec = oppMs / 1000
 			if oppSec < 15 and mySec > (oppSec + 8) then
-				return "smug", string.format("Jam lawan sekarat tinggal %.0fd — terus tekan jangan kasih napas!", oppSec), BADGE_COLORS.gm
+				return "smug", string.format("Jam lawan tinggal %.0fd — terus tekan!", oppSec), BADGE_COLORS.gm
 			elseif mySec < 20 then
-				return "panic", string.format("Jam mepet (%.0fd)! Gerak cepat biar gak kena flag.", mySec), BADGE_COLORS.turbo
+				return "panic", string.format("Jam mepet (%.0fd)! Gerak cepat biar aman.", mySec), BADGE_COLORS.turbo
 			elseif (CONFIG.MaxClockLead or 30) > 0 and (mySec - oppSec) > (CONFIG.MaxClockLead or 30) and mySec >= 42 then
-				return "calm", string.format("Jam unggul jauh (+%dd) — santaiin dikit biar ritme natural.", math.floor(mySec - oppSec)), BADGE_COLORS.vpssf
+				return "calm", string.format("Jam unggul +%dd — santaiin dikit biar natural.", math.floor(mySec - oppSec)), BADGE_COLORS.vpssf
 			end
 		end
 	end
 
 	-- 8. Thinking / Waiting / General Position Commentary
 	if thinking then
-		return "thinking", "Bentaran, lagi ngintip variasi paling mantap...", BADGE_COLORS.thinking
+		return "thinking", "Bentaran, lagi ngintip variasi paling tajam...", BADGE_COLORS.thinking
 	end
 	if sess.myColor ~= nil and not sess:isMyTurn() then
+		if sess.kind == "puzzle" or sess.kind == "rush" then
+			return "calm", "Langkah bagus! Tunggu balasan puzzle sebentar...", BADGE_COLORS.puzzle
+		end
 		local prefetching = (STATE.PrefetchDone ~= nil and not STATE.PrefetchDone.done)
 		if prefetching then
-			return "thinking", "Sambil nunggu lawan mikir, aku siapin balasan 0ms duluan.", BADGE_COLORS.vpssf
+			return "thinking", "Sambil lawan mikir, aku siapin balasan 0ms.", BADGE_COLORS.vpssf
 		end
-		return "calm", "Giliran lawan — kita liat dia berani gerak ke mana.", BADGE_COLORS.idle
+		return "calm", "Giliran lawan — kita liat dia berani ke mana.", BADGE_COLORS.idle
 	end
 
 	if myEval >= 320 and totalPieces <= 12 then
-		return "smug", string.format("Menang telak (+%.1f)! Tinggal konversi endgame bersih aja.", myEval / 100), BADGE_COLORS.gm
+		return "smug", string.format("Menang telak (+%.1f), konversi endgame bersih!", myEval / 100), BADGE_COLORS.gm
 	elseif myEval >= 180 then
-		return "smug", string.format("Posisi enak banget (+%.1f) — jaga tekanan terus!", myEval / 100), BADGE_COLORS.gm
+		return "smug", string.format("Posisi enak (+%.1f) — jaga tekanan terus.", myEval / 100), BADGE_COLORS.gm
 	elseif myEval <= -180 then
-		return "panic", string.format("Lagi ketekan (%.1f), cari counterplay & rapetin posisi.", myEval / 100), BADGE_COLORS.fallback
+		return "panic", string.format("Lagi ketekan (%.1f), cari counterplay!", myEval / 100), BADGE_COLORS.fallback
 	elseif fullMove <= (CONFIG.FastOpeningMoves or 5) then
-		return "calm", string.format("Opening lancar (#%d), main cepet buat nabung jam.", fullMove), BADGE_COLORS.book
+		return "calm", string.format("Opening lancar (#%d), hemat waktu buat tengah.", fullMove), BADGE_COLORS.book
 	elseif res and res.gmRank and res.gmRank > 1 then
-		return "calm", string.format("Ambil opsi #%d (-%dcp) biar gaya mainnya kerasa manusiawi.", res.gmRank, res.gmLossCp or 0), BADGE_COLORS.gm
+		return "calm", string.format("Ambil opsi #%d (-%dcp) biar main natural.", res.gmRank, res.gmLossCp or 0), BADGE_COLORS.gm
 	end
 
-	return "calm", "Posisi masih aman terkendali — lanjut sesuai rencana.", BADGE_COLORS.stockfish
+	return "calm", "Posisi aman terkendali — lanjut sesuai rencana.", BADGE_COLORS.stockfish
 end
 
 local function updateEngineBadge(text, kind, sess, res, thinking)
@@ -5984,36 +5682,67 @@ local function updateEngineBadge(text, kind, sess, res, thinking)
 	HUD.title.Text = text
 	HUD.dot.BackgroundColor3 = col
 
-	-- Keep card border understated matte; only gently tint on Mate or Turbo/Danger alerts
+	-- Clean RoChess-native outline (subtle tint only on Mate / Turbo)
 	local isMateAlert = (res and res.mate and res.mate ~= 0)
 	if isMateAlert then
-		HUD.stroke.Color = Color3.fromRGB(190, 152, 62)
+		HUD.stroke.Color = Color3.fromRGB(168, 134, 58)
 	elseif kind == "turbo" then
-		HUD.stroke.Color = Color3.fromRGB(168, 66, 70)
+		HUD.stroke.Color = Color3.fromRGB(164, 62, 62)
 	else
-		HUD.stroke.Color = Color3.fromRGB(50, 55, 68)
+		HUD.stroke.Color = Color3.fromRGB(64, 68, 76)
 	end
 
-	-- Update Eval Pill on right of Meta Row
+	-- High-contrast Chess.com / Lichess Eval Pill
 	local evCp = (res and res.evalCp) or STATE.EvalWhiteCp or 0
 	local evMate = (res and res.mate) or STATE.EvalMate
-	local evTxt = (sess and sess.kind ~= "idle") and formatEvalText(evCp, evMate) or "--"
+	local hasGame = (sess ~= nil and sess.kind ~= "idle")
+	local evTxt = "--"
+	if hasGame then
+		if evMate and evMate ~= 0 then
+			evTxt = (evMate > 0 and "+M" or "-M") .. tostring(math.abs(evMate))
+		else
+			local pw = evCp / 100
+			if math.abs(pw) < 0.05 then
+				evTxt = "0.0"
+			elseif math.abs(pw) >= 10 then
+				evTxt = string.format("%+.0f", pw)
+			else
+				evTxt = string.format("%+.1f", pw)
+			end
+		end
+	end
 	HUD.evalText.Text = evTxt
+
 	local myColor = (sess and sess.myColor) or 1
-	local myEv = evCp * myColor
 	local myM = evMate and (evMate * myColor) or nil
-	if myM and myM ~= 0 then
-		HUD.evalPill.BackgroundColor3 = (myM > 0) and Color3.fromRGB(68, 54, 24) or Color3.fromRGB(70, 28, 30)
-		HUD.evalText.TextColor3 = (myM > 0) and Color3.fromRGB(246, 208, 96) or Color3.fromRGB(248, 134, 134)
-	elseif myEv >= 120 then
-		HUD.evalPill.BackgroundColor3 = Color3.fromRGB(26, 52, 44)
-		HUD.evalText.TextColor3 = Color3.fromRGB(116, 224, 182)
-	elseif myEv <= -120 then
-		HUD.evalPill.BackgroundColor3 = Color3.fromRGB(58, 28, 32)
-		HUD.evalText.TextColor3 = Color3.fromRGB(244, 136, 136)
+	if not hasGame then
+		HUD.evalPill.BackgroundColor3 = Color3.fromRGB(50, 52, 57)
+		HUD.evalText.TextColor3 = Color3.fromRGB(178, 182, 190)
+		if HUD.evalStroke then HUD.evalStroke.Color = Color3.fromRGB(70, 74, 84) end
+	elseif myM and myM ~= 0 then
+		if myM > 0 then
+			HUD.evalPill.BackgroundColor3 = Color3.fromRGB(242, 190, 66)
+			HUD.evalText.TextColor3 = Color3.fromRGB(26, 20, 8)
+			if HUD.evalStroke then HUD.evalStroke.Color = Color3.fromRGB(242, 190, 66) end
+		else
+			HUD.evalPill.BackgroundColor3 = Color3.fromRGB(202, 52, 49)
+			HUD.evalText.TextColor3 = Color3.fromRGB(255, 255, 255)
+			if HUD.evalStroke then HUD.evalStroke.Color = Color3.fromRGB(224, 86, 82) end
+		end
+	elseif evCp >= 30 then
+		-- White advantage: crisp ivory pill + dark ink
+		HUD.evalPill.BackgroundColor3 = Color3.fromRGB(240, 239, 234)
+		HUD.evalText.TextColor3 = Color3.fromRGB(22, 24, 30)
+		if HUD.evalStroke then HUD.evalStroke.Color = Color3.fromRGB(210, 208, 200) end
+	elseif evCp <= -30 then
+		-- Black advantage: crisp obsidian pill + bright white ink
+		HUD.evalPill.BackgroundColor3 = Color3.fromRGB(23, 24, 27)
+		HUD.evalText.TextColor3 = Color3.fromRGB(243, 244, 246)
+		if HUD.evalStroke then HUD.evalStroke.Color = Color3.fromRGB(78, 82, 92) end
 	else
-		HUD.evalPill.BackgroundColor3 = Color3.fromRGB(34, 38, 48)
-		HUD.evalText.TextColor3 = Color3.fromRGB(224, 230, 240)
+		HUD.evalPill.BackgroundColor3 = Color3.fromRGB(54, 57, 64)
+		HUD.evalText.TextColor3 = Color3.fromRGB(236, 238, 244)
+		if HUD.evalStroke then HUD.evalStroke.Color = Color3.fromRGB(78, 82, 92) end
 	end
 
 	-- Update Coach Avatar Mood & Speech
@@ -6046,6 +5775,9 @@ local function resetOpponentTracker(sess, gameId)
 	o.clockPressure = false
 	o.turboActive = false
 	o.turboReason = nil
+	o.spectators = 0
+	o.spectatorPaused = false
+	o.spectatorNotified = false
 	o.notified = false
 	o.adaptTier = nil
 	o.lastAdaptPly = -1
@@ -6123,21 +5855,32 @@ local function recomputeOpponentSuspicion()
 	end
 end
 
+local function getLiveSpectatorCount(sess)
+	if not sess or sess.kind ~= "online" or sess.over then
+		return 0
+	end
+	local n = tonumber(sess.watchers) or 0
+	return (n > 0) and math.floor(n) or 0
+end
+
 local function formatOpponentLabel(sess)
 	if not sess or sess.kind ~= "online" then
 		return "Opponent: --"
 	end
 	local o = STATE.Opp
-	if o.engineDetected then
-		return string.format("Opponent: ENGINE (%d%% · %d/%d) · TURBO", o.suspicion, o.hits, o.checked)
+	local specSuffix = ((o.spectators or 0) > 0) and string.format(" · %d spec", o.spectators) or ""
+	if o.spectatorPaused then
+		return string.format("Opponent: %s (%d%%) · TURBO PAUSED%s", o.engineDetected and "ENGINE" or "Pressure", o.suspicion, specSuffix)
+	elseif o.engineDetected then
+		return string.format("Opponent: ENGINE (%d%% · %d/%d) · TURBO%s", o.suspicion, o.hits, o.checked, specSuffix)
 	elseif o.turboActive then
-		return string.format("Opponent: %s%d%% · TURBO (%s)", o.suspect and "SUSPECT " or "", o.suspicion, o.turboReason or "Clock")
+		return string.format("Opponent: %s%d%% · TURBO (%s)%s", o.suspect and "SUSPECT " or "", o.suspicion, o.turboReason or "Clock", specSuffix)
 	elseif o.suspect then
-		return string.format("Opponent: SUSPECT (%d%% · %d/%d match)", o.suspicion, o.hits, o.checked)
+		return string.format("Opponent: SUSPECT (%d%% · %d/%d match)%s", o.suspicion, o.hits, o.checked, specSuffix)
 	elseif o.checked > 0 then
-		return string.format("Opponent: Human (%d%% · %d/%d match)", o.suspicion, o.hits, o.checked)
+		return string.format("Opponent: Human (%d%% · %d/%d match)%s", o.suspicion, o.hits, o.checked, specSuffix)
 	end
-	return "Opponent: Scanning..."
+	return "Opponent: Scanning..." .. specSuffix
 end
 
 local function updateOpponentDetector(sess)
@@ -6311,16 +6054,46 @@ local function updateOpponentDetector(sess)
 	o.clockPressure = clockPressure
 
 	local farmSuppress = (CONFIG.AutoFarm and STATE.Farm.throwArmed == true)
-	local wantTurbo = (not farmSuppress) and CONFIG.AntiEngineTurbo and (o.engineDetected or clockPressure)
+	local spectators = getLiveSpectatorCount(sess)
+	local rawWantTurbo = (not farmSuppress) and CONFIG.AntiEngineTurbo and (o.engineDetected or clockPressure)
+	local specSuppress = CONFIG.PauseTurboOnSpectate and (spectators > 0)
+	local wantTurbo = rawWantTurbo and (not specSuppress)
+
+	o.spectators = spectators
+	o.spectatorPaused = specSuppress and rawWantTurbo
 	o.turboActive = wantTurbo
-	o.turboReason = (not farmSuppress) and (o.engineDetected and "Engine" or (clockPressure and "Clock" or nil)) or nil
+	o.turboReason = wantTurbo and (o.engineDetected and "Engine" or (clockPressure and "Clock" or nil)) or nil
+
+	if o.spectatorPaused and not o.spectatorNotified then
+		o.spectatorNotified = true
+		pcall(function()
+			Library:Notify({
+				Title = "Turbo Paused (Spectator)",
+				Description = string.format("Ada %d penonton — Turbo ditahan otomatis sampai nggak ada yang spectate.", spectators),
+				Time = 4.0,
+			})
+		end)
+	elseif spectators == 0 and o.spectatorNotified then
+		o.spectatorNotified = false
+		if wantTurbo then
+			pcall(function()
+				Library:Notify({
+					Title = "Turbo Resumed",
+					Description = "Semua penonton sudah keluar — Turbo Mode aktif kembali.",
+					Time = 3.5,
+				})
+			end)
+		end
+	end
 
 	if o.engineDetected and not o.notified and CONFIG.AntiEngineTurbo and not farmSuppress then
 		o.notified = true
 		pcall(function()
 			Library:Notify({
 				Title = "Engine Opponent Detected",
-				Description = string.format("Suspicion %d%% (%d/%d non-trivial top moves). Full SF19 + Turbo engaged.", o.suspicion, o.hits, o.checked),
+				Description = o.spectatorPaused
+					and string.format("Suspicion %d%% (%d/%d). Turbo ditahan sementara karena ada %d penonton.", o.suspicion, o.hits, o.checked, spectators)
+					or string.format("Suspicion %d%% (%d/%d non-trivial top moves). Full SF19 + Turbo engaged.", o.suspicion, o.hits, o.checked),
 				Time = 4.5,
 			})
 		end)
@@ -7136,6 +6909,100 @@ do
 	end
 end
 
+local function findVisiblePuzzleNextButton(app)
+	local pzPage = app and app.pages and app.pages.puzzles
+	local root = pzPage and pzPage.frame
+	if not root or not root.Visible then
+		return nil
+	end
+	local function isAncestorChainVisible(obj)
+		local cur = obj
+		while cur and cur ~= root do
+			if cur:IsA("GuiObject") and not cur.Visible then
+				return false
+			end
+			cur = cur.Parent
+		end
+		return true
+	end
+	for _, desc in ipairs(root:GetDescendants()) do
+		if (desc:IsA("TextLabel") or desc:IsA("TextButton")) and (desc.Text == "Next" or desc.Text == "Try Again") then
+			local cur = desc:IsA("GuiButton") and desc or desc.Parent
+			while cur and cur ~= root do
+				if cur:IsA("GuiButton") then
+					if cur.Visible and cur.AbsoluteSize.X >= 30 and cur.AbsoluteSize.Y >= 20 and isAncestorChainVisible(cur) then
+						return cur
+					end
+					break
+				end
+				cur = cur.Parent
+			end
+		end
+	end
+	return nil
+end
+
+local function tickAutoNextPuzzle(app, sess, now)
+	if not CONFIG.AutoNextPuzzle or not app or not app.pages or app.pages.current ~= "puzzles" then
+		STATE.PuzzleDoneKey = ""
+		STATE.PuzzleDoneAt = 0
+		return
+	end
+	local pz = (sess and sess.kind == "puzzle") and sess.pz or nil
+	if not pz or not pz.done or pz.busy then
+		STATE.PuzzleDoneKey = ""
+		STATE.PuzzleDoneAt = 0
+		return
+	end
+
+	local pKey = tostring(sess) .. "|" .. tostring(pz.data and pz.data.id or "")
+	if STATE.PuzzleDoneKey ~= pKey then
+		STATE.PuzzleDoneKey = pKey
+		STATE.PuzzleDoneAt = now
+		STATE.PuzzleNextDelay = randTriangular(0.95, 1.55)
+		return
+	end
+	if (now - STATE.PuzzleDoneAt) < (STATE.PuzzleNextDelay or 1.15) then
+		return
+	end
+	if (now - (STATE.PuzzleNextClickAt or 0)) < 3.2 then
+		return
+	end
+	local safeIn = isSafeToSendInput()
+	if not safeIn then
+		return
+	end
+
+	local nextBtn = findVisiblePuzzleNextButton(app)
+	if not nextBtn then
+		return
+	end
+
+	STATE.PuzzleNextClickAt = now
+	task.spawn(function()
+		if not STATE.Alive or not CONFIG.AutoNextPuzzle then
+			return
+		end
+		local inset = GuiService:GetGuiInset()
+		local btnPos = nextBtn.AbsolutePosition + inset
+		local btnSz = nextBtn.AbsoluteSize
+		if btnSz.X < 30 or btnSz.Y < 20 then
+			return
+		end
+		local pt = Vector2.new(btnPos.X + btnSz.X * 0.5, btnPos.Y + btnSz.Y * 0.5)
+		ensureBoardUnoccluded(pt, pt, inset)
+		if isPointOverBadge(pt, inset) and HUD.root then
+			HUD.tempHiddenForClick = true
+			HUD.root.Visible = false
+			pcall(function() RunService.RenderStepped:Wait() end)
+		end
+		local jx = (math.random() * 2 - 1) * math.min(8, btnSz.X * 0.14)
+		local jy = (math.random() * 2 - 1) * math.min(5, btnSz.Y * 0.16)
+		pcall(sendSafeClick, pt.X + jx, pt.Y + jy, false)
+		HUD.tempHiddenForClick = false
+	end)
+end
+
 local function tickAutoFindMatch(app, sess, now)
 	if (not CONFIG.AutoFindMatch and not CONFIG.AutoFarm) or not app or not app.profile then
 		STATE.Farm.idleSince = 0
@@ -7241,12 +7108,16 @@ local function updateHudReadout(sess, res, thinking)
 
 	local turboTag = ""
 	if CONFIG.AutoFarm and STATE.Farm.throwArmed and sess.kind == "online" then
-		turboTag = (STATE.Farm.phase == "resigning") and " [RESIGN]" or " [FARM]"
+		turboTag = (STATE.Farm.phase == "resigning") and " · Resign" or " · Farm"
 	elseif CONFIG.AntiEngineTurbo and sess.kind == "online" then
-		if STATE.Opp.turboActive then
-			turboTag = " [TURBO]"
+		if STATE.Opp.spectatorPaused and (STATE.Opp.spectators or 0) > 0 then
+			turboTag = string.format(" · Turbo Pause (%d spec)", STATE.Opp.spectators)
+		elseif STATE.Opp.turboActive then
+			turboTag = " · Turbo"
 		elseif STATE.Opp.suspect then
-			turboTag = " [SUSPECT]"
+			turboTag = " · Suspect"
+		elseif (STATE.Opp.spectators or 0) > 0 then
+			turboTag = string.format(" · %d spec", STATE.Opp.spectators)
 		end
 	end
 
@@ -7281,14 +7152,21 @@ local function updateHudReadout(sess, res, thinking)
 	else
 		local isTerminal = (STATE.TerminalKey ~= "" and STATE.TerminalKey == STATE.LastKey)
 		local prefetching = (STATE.PrefetchDone ~= nil and not STATE.PrefetchDone.done)
-		local waitTxt = isTerminal and "Terminal Position"
-			or (prefetching and "Prefetching Ponder..." or ("Waiting (" .. CONFIG.EngineMode .. ")"))
+		local isPuzzleDone = (sess.kind == "puzzle" and sess.pz and sess.pz.done)
+		local waitTxt = isPuzzleDone and "Puzzle · Selesai"
+			or ((sess.kind == "puzzle" or sess.kind == "rush") and "Puzzle · Giliran Lawan")
+			or (isTerminal and "Posisi Akhir")
+			or (prefetching and "Ponder Prefetch...")
+			or ("Menunggu · " .. CONFIG.EngineMode)
 		setUiLabel("EngineLabel", "Active Engine: " .. waitTxt .. turboTag)
-		setUiLabel("BestMoveLabel", (sess.over or isTerminal) and "Best Move: Game Over" or "Best Move: Waiting...")
+		setUiLabel("BestMoveLabel", (sess.over or isTerminal or isPuzzleDone) and "Best Move: Finished" or "Best Move: Waiting...")
 		setUiLabel("EvalLabel", "Eval: --")
 		setUiLabel("LineLabel", "Line: --")
-		setPulseStatus((sess.over or isTerminal) and "Finished" or "Waiting", kindCap .. " · " .. turnTxt)
-		updateEngineBadge(((sess.over or isTerminal) and "Game Over" or waitTxt) .. turboTag, (STATE.Opp.turboActive and CONFIG.AntiEngineTurbo and sess.kind == "online") and "turbo" or "idle", sess, nil, false)
+		setPulseStatus((sess.over or isTerminal or isPuzzleDone) and "Finished" or "Waiting", kindCap .. " · " .. turnTxt)
+		local badgeKind = (isPuzzleDone and "puzzle")
+			or ((STATE.Opp.turboActive and CONFIG.AntiEngineTurbo and sess.kind == "online") and "turbo")
+			or "idle"
+		updateEngineBadge(((sess.over or isTerminal) and "Game Over" or waitTxt) .. turboTag, badgeKind, sess, nil, false)
 	end
 end
 
@@ -7705,6 +7583,7 @@ task.spawn(function()
 			end
 			tickWatchdogs(app, sess, now)
 			tickAutoFindMatch(app, sess, now)
+			tickAutoNextPuzzle(app, sess, now)
 			-- Live-refresh Coach speech & mood every ~0.35s so clock/breather/draw callouts stay fresh
 			if HUD.root and HUD.root.Visible and (now - (HUD.lastFyiAt or 0)) >= 0.35 then
 				HUD.lastFyiAt = now
